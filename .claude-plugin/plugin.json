@@ -1,0 +1,12 @@
+{
+  "name": "context-introspect",
+  "description": "Claude audits its own context window — finds which MCP servers and skills cost tokens or sit unused, and disables them reversibly.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Catalin-Stefan Niculescu",
+    "url": "https://github.com/catancs"
+  },
+  "homepage": "https://github.com/catancs/context-introspect",
+  "license": "MIT",
+  "keywords": ["context", "tokens", "mcp", "skills", "audit", "cleanup"]
+}
