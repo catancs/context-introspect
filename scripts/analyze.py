@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -373,21 +372,63 @@ def _store(disabled_root: Path, item_type: str, name: str) -> Path:
     return disabled_root / item_type / name
 
 
+def _find_mcp_server(name: str, home: Path, project: Path) -> tuple[Path, str | None, dict] | None:
+    """Find an MCP server entry and return (file_path, project_key, full_data).
+
+    Searches in order:
+      1. ~/.claude.json top-level mcpServers
+      2. ~/.claude.json projects.<key>.mcpServers for each key
+      3. project/.mcp.json mcpServers
+
+    Returns None if not found.
+    """
+    cj = home / ".claude.json"
+    if cj.exists():
+        data = _load_json(cj)
+        if name in (data.get("mcpServers") or {}):
+            return (cj, None, data)
+        for proj_key, proj_cfg in (data.get("projects") or {}).items():
+            if name in (proj_cfg.get("mcpServers") or {}):
+                return (cj, proj_key, data)
+
+    mcp_json = project / ".mcp.json"
+    if mcp_json.exists():
+        data = _load_json(mcp_json)
+        if name in (data.get("mcpServers") or {}):
+            return (mcp_json, None, data)
+
+    return None
+
+
 def disable_item(item_type: str, name: str, home: Path, project: Path, disabled_root: Path) -> dict:
     if item_type == "mcp":
-        cj = home / ".claude.json"
-        data = _load_json(cj)
-        servers = data.get("mcpServers", {})
-        if name not in servers:
-            return {"ok": False, "error": f"MCP server '{name}' not found in {cj}"}
-        backup = disabled_root / f"claude.json.{int(datetime.now().timestamp())}.bak"
+        found = _find_mcp_server(name, home, project)
+        if found is None:
+            return {"ok": False, "error": f"MCP server '{name}' not found"}
+        file_path, project_key, data = found
+
+        backup = disabled_root / f"{file_path.name}.{int(datetime.now().timestamp())}.bak"
         backup.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cj, backup)
+        shutil.copy2(file_path, backup)
+
+        # Remove from the correct location
+        if project_key is not None:
+            servers = data["projects"][project_key]["mcpServers"]
+        else:
+            servers = data["mcpServers"]
         removed = servers.pop(name)
+
         store = _store(disabled_root, "mcp", name)
         store.mkdir(parents=True, exist_ok=True)
-        (store / "server.json").write_text(json.dumps({"name": name, "config": removed}, indent=2))
-        cj.write_text(json.dumps(data, indent=2))
+        (store / "server.json").write_text(json.dumps({
+            "name": name,
+            "config": removed,
+            "location": {
+                "file": str(file_path),
+                "project_key": project_key,
+            },
+        }, indent=2))
+        file_path.write_text(json.dumps(data, indent=2))
         return {"ok": True, "disabled": name,
                 "undo": f"python3 analyze.py undo mcp {name}", "backup": str(backup)}
 
@@ -407,10 +448,18 @@ def undo_item(item_type: str, name: str, home: Path, project: Path, disabled_roo
         if not store.exists():
             return {"ok": False, "error": f"no disabled MCP server '{name}'"}
         saved = json.loads(store.read_text())
-        cj = home / ".claude.json"
-        data = _load_json(cj)
-        data.setdefault("mcpServers", {})[name] = saved["config"]
-        cj.write_text(json.dumps(data, indent=2))
+        location = saved.get("location", {})
+        file_path = Path(location["file"]) if location.get("file") else home / ".claude.json"
+        project_key = location.get("project_key")
+
+        data = _load_json(file_path)
+        if project_key is not None:
+            data.setdefault("projects", {}).setdefault(project_key, {}).setdefault(
+                "mcpServers", {}
+            )[name] = saved["config"]
+        else:
+            data.setdefault("mcpServers", {})[name] = saved["config"]
+        file_path.write_text(json.dumps(data, indent=2))
         shutil.rmtree(_store(disabled_root, "mcp", name))
         return {"ok": True, "restored": name}
 
