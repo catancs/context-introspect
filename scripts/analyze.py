@@ -208,12 +208,13 @@ def _iter_tool_uses(obj: dict):
             yield block.get("name", ""), (block.get("input") or {})
 
 
-def parse_usage(projects_dir: Path, now: datetime) -> tuple[dict, datetime | None]:
+def parse_usage(projects_dir: Path, now: datetime) -> tuple[dict, datetime | None, int]:
     cutoff = now - timedelta(days=WINDOW_DAYS)
     usage: dict = defaultdict(lambda: {"all": 0, "30d": 0, "last": None, "projects": set()})
     earliest: datetime | None = None
+    parse_warnings: int = 0
     if not projects_dir.is_dir():
-        return usage, earliest
+        return usage, earliest, parse_warnings
 
     for jsonl in projects_dir.glob("*/*.jsonl"):
         project = jsonl.parent.name
@@ -229,6 +230,7 @@ def parse_usage(projects_dir: Path, now: datetime) -> tuple[dict, datetime | Non
                 try:
                     obj = json.loads(line)
                 except ValueError:
+                    parse_warnings += 1
                     continue
                 ts = parse_ts(obj.get("timestamp"))
                 if ts and (earliest is None or ts < earliest):
@@ -242,7 +244,7 @@ def parse_usage(projects_dir: Path, now: datetime) -> tuple[dict, datetime | Non
                         if ts and (rec["last"] is None or ts > rec["last"]):
                             rec["last"] = ts
                         rec["projects"].add(project)
-    return usage, earliest
+    return usage, earliest, parse_warnings
 
 
 # ---------------------------------------------------------------------------
@@ -312,9 +314,11 @@ def run_audit(home: Path, project: Path, now: datetime) -> dict:
     items += collect_md_items(project / ".claude" / "commands", "command", "project")
     items += collect_memory(home, project)
     items += collect_mcp_servers(home, project)
-    usage, earliest = parse_usage(home / ".claude" / "projects", now)
+    usage, earliest, parse_warnings = parse_usage(home / ".claude" / "projects", now)
     merge_usage(items, usage)
-    return build_output(items, earliest, now)
+    out = build_output(items, earliest, now)
+    out["totals"]["parse_warnings"] = parse_warnings
+    return out
 
 
 # ---------------------------------------------------------------------------
