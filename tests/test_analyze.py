@@ -242,7 +242,7 @@ class TestKeysForToolAndParseUsage(unittest.TestCase):
                 ),
             ],
         )
-        usage, earliest = analyze.parse_usage(projects, now)
+        usage, earliest, parse_warnings = analyze.parse_usage(projects, now)
         gh = usage[("mcp", "github")]
         self.assertEqual(gh["all"], 2)
         self.assertEqual(gh["30d"], 1)
@@ -250,6 +250,23 @@ class TestKeysForToolAndParseUsage(unittest.TestCase):
         self.assertEqual(gh["projects"], {"-proj-a"})
         self.assertEqual(usage[("skill", "deep-research")]["30d"], 1)
         self.assertEqual(earliest, datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc))
+        self.assertEqual(parse_warnings, 0)
+
+    def test_parse_usage_counts_malformed_lines(self):
+        """parse_usage returns parse_warnings count for malformed JSONL lines."""
+        projects = self.tmp_path / "projects"
+        proj_dir = projects / "-proj-b"
+        proj_dir.mkdir(parents=True)
+        # One malformed line + one valid tool_use line
+        lines = [
+            "{not json",
+            _json.dumps(_assistant_line("2026-05-27T10:00:00Z", "mcp__github__x")),
+        ]
+        (proj_dir / "session.jsonl").write_text("\n".join(lines))
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        usage, earliest, parse_warnings = analyze.parse_usage(projects, now)
+        self.assertEqual(parse_warnings, 1)
+        self.assertEqual(usage[("mcp", "github")]["all"], 1)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +401,151 @@ class TestDisableAndUndo(unittest.TestCase):
         self.assertTrue(list(disabled.glob("*.bak")))  # a backup was written
         analyze.undo_item("mcp", "victim", home, project, disabled)
         self.assertIn("victim", _json.loads(cj.read_text())["mcpServers"])
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: collect_plugin_skills
+# ---------------------------------------------------------------------------
+
+class TestCollectPluginSkills(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _write_plugin_skill(self, home, market, plugin, version, skill_name, description, body="plugin body"):
+        skill_dir = (
+            home / ".claude" / "plugins" / market / plugin / version / "skills" / skill_name
+        )
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\ndescription: {description}\n---\n{body}\n"
+        )
+        return skill_dir
+
+    def test_collect_plugin_skills_returns_one_item(self):
+        home = self.tmp_path / "home"
+        self._write_plugin_skill(
+            home, "somemarket", "myplugin", "1.0.0", "coolskill", "a cool plugin skill"
+        )
+        items = analyze.collect_plugin_skills(home)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertEqual(it["name"], "coolskill")
+        self.assertEqual(it["scope"], "plugin")
+        self.assertEqual(it["type"], "skill")
+        self.assertGreater(it["persistent_tokens_est"], 0)
+        self.assertEqual(it["cost_basis"], "estimated")
+
+    def test_collect_plugin_skills_no_plugins_dir(self):
+        home = self.tmp_path / "home"
+        home.mkdir()
+        items = analyze.collect_plugin_skills(home)
+        self.assertEqual(items, [])
+
+    def test_collect_plugin_skills_dedup_by_source_path(self):
+        """Two SKILL.md files in the same skill dir should produce one item."""
+        home = self.tmp_path / "home"
+        # Write two different plugin skills
+        self._write_plugin_skill(home, "m", "p", "1.0", "skill-a", "desc a")
+        self._write_plugin_skill(home, "m", "p", "1.0", "skill-b", "desc b")
+        items = analyze.collect_plugin_skills(home)
+        self.assertEqual(len(items), 2)
+        paths = {i["source_path"] for i in items}
+        self.assertEqual(len(paths), 2)
+
+    def test_run_audit_includes_plugin_skills(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        self._write_plugin_skill(
+            home, "somemarket", "myplugin", "1.0.0", "coolskill", "a cool plugin skill"
+        )
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        out = analyze.run_audit(home, project, now)
+        plugin_items = [i for i in out["items"] if i.get("scope") == "plugin"]
+        self.assertEqual(len(plugin_items), 1)
+        self.assertEqual(plugin_items[0]["name"], "coolskill")
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: disable_item / undo_item for project-scoped & .mcp.json MCP servers
+# ---------------------------------------------------------------------------
+
+class TestDisableMcpProjectScoped(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_disable_undo_mcp_in_claude_json_projects_key(self):
+        """disable_item finds and removes a server under projects[path].mcpServers."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        home.mkdir()
+        project.mkdir()
+        cj = home / ".claude.json"
+        cj.write_text(_json.dumps({
+            "mcpServers": {"global-srv": {"command": "g"}},
+            "projects": {
+                "/some/path": {
+                    "mcpServers": {
+                        "proj-victim": {"command": "p"},
+                        "proj-keep": {"command": "k"},
+                    }
+                }
+            },
+        }))
+        disabled = home / ".claude" / "ci-disabled"
+
+        # Disable
+        res = analyze.disable_item("mcp", "proj-victim", home, project, disabled)
+        self.assertTrue(res["ok"], res)
+        data = _json.loads(cj.read_text())
+        self.assertNotIn("proj-victim", data["projects"]["/some/path"]["mcpServers"])
+        self.assertIn("proj-keep", data["projects"]["/some/path"]["mcpServers"])
+        self.assertIn("global-srv", data["mcpServers"])
+
+        # Undo
+        res2 = analyze.undo_item("mcp", "proj-victim", home, project, disabled)
+        self.assertTrue(res2["ok"], res2)
+        data2 = _json.loads(cj.read_text())
+        self.assertIn("proj-victim", data2["projects"]["/some/path"]["mcpServers"])
+
+    def test_disable_undo_mcp_in_dot_mcp_json(self):
+        """disable_item finds and removes a server in project/.mcp.json."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        home.mkdir()
+        project.mkdir()
+        cj = home / ".claude.json"
+        cj.write_text(_json.dumps({"mcpServers": {}}))
+        mcp_json = project / ".mcp.json"
+        mcp_json.write_text(_json.dumps({
+            "mcpServers": {
+                "local-victim": {"command": "lv"},
+                "local-keep": {"command": "lk"},
+            }
+        }))
+        disabled = home / ".claude" / "ci-disabled"
+
+        # Disable
+        res = analyze.disable_item("mcp", "local-victim", home, project, disabled)
+        self.assertTrue(res["ok"], res)
+        mcp_data = _json.loads(mcp_json.read_text())
+        self.assertNotIn("local-victim", mcp_data["mcpServers"])
+        self.assertIn("local-keep", mcp_data["mcpServers"])
+
+        # Undo
+        res2 = analyze.undo_item("mcp", "local-victim", home, project, disabled)
+        self.assertTrue(res2["ok"], res2)
+        mcp_data2 = _json.loads(mcp_json.read_text())
+        self.assertIn("local-victim", mcp_data2["mcpServers"])
 
 
 if __name__ == "__main__":
