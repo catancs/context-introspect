@@ -98,6 +98,60 @@ def collect_plugin_skills(home: Path) -> list[Item]:
     return items
 
 
+def collect_plugin_agents(home: Path) -> list[Item]:
+    """Return Items for plugin-provided agents under ~/.claude/plugins/."""
+    plugins_dir = home / ".claude" / "plugins"
+    if not plugins_dir.is_dir():
+        return []
+    items: list[Item] = []
+    seen_paths: set[str] = set()
+    for md in plugins_dir.rglob("*.md"):
+        if md.parent.name != "agents":
+            continue
+        src = str(md)
+        if src in seen_paths:
+            continue
+        seen_paths.add(src)
+        description, body = read_frontmatter(md)
+        items.append({
+            "type": "subagent",
+            "name": md.stem,
+            "scope": "plugin",
+            "persistent_tokens_est": estimate_tokens(description),
+            "ondemand_tokens_est": estimate_tokens(body),
+            "cost_basis": "estimated",
+            "source_path": src,
+        })
+    return items
+
+
+def collect_plugin_commands(home: Path) -> list[Item]:
+    """Return Items for plugin-provided commands under ~/.claude/plugins/."""
+    plugins_dir = home / ".claude" / "plugins"
+    if not plugins_dir.is_dir():
+        return []
+    items: list[Item] = []
+    seen_paths: set[str] = set()
+    for md in plugins_dir.rglob("*.md"):
+        if md.parent.name != "commands":
+            continue
+        src = str(md)
+        if src in seen_paths:
+            continue
+        seen_paths.add(src)
+        description, body = read_frontmatter(md)
+        items.append({
+            "type": "command",
+            "name": md.stem,
+            "scope": "plugin",
+            "persistent_tokens_est": estimate_tokens(description),
+            "ondemand_tokens_est": estimate_tokens(body),
+            "cost_basis": "estimated",
+            "source_path": src,
+        })
+    return items
+
+
 def collect_skills(home: Path, project: Path) -> list[Item]:
     items: list[Item] = []
     for root, scope in ((home, "user"), (project, "project")):
@@ -310,11 +364,13 @@ def build_output(items: list[Item], earliest, now) -> dict:
     context_tax = sum(persistent(i) for i in items)
     reclaimable = sum(
         persistent(i) for i in items
-        if i["type"] not in ("memory", "command")
+        if verdict_for_item(i) == "cut"
         and i["persistent_tokens_est"] is not None
-        and i["invocations_30d"] == 0
     )
-    unused_mcp = sum(1 for i in items if i["type"] == "mcp" and i["invocations_30d"] == 0)
+    unused_mcp = sum(
+        1 for i in items
+        if i["type"] == "mcp" and verdict_for_item(i) == "cut"
+    )
     horizon = (now - earliest).days if earliest else 0
 
     ordered = sorted(items, key=lambda i: (-persistent(i), i["invocations_30d"]))
@@ -339,29 +395,20 @@ def verdict_for_item(item: Item) -> str:
     """Return "cut" | "keep" | "review" for a fully-merged item.
 
     Rules (in priority order):
-    - type == "memory"         → "review"  (always-loaded; judged by size)
-    - type == "command"        → "review"  (usage not tracked in v1)
-    - scope == "plugin"        → "review"  (managed by its plugin)
-    - type in skill/subagent, not plugin:
-        invocations_30d == 0   → "cut"
-        else                   → "keep"
-    - type == "mcp":
-        invocations_30d == 0   → "cut"
-        else                   → "keep"
+    - type == "memory"               → "review"  (always-loaded; judged by size)
+    - invocations_30d > 0            → "keep"    (used → keep, regardless of scope)
+    - type == "command" or
+      scope == "plugin"              → "review"  (unused, but not individually disable-able)
+    - otherwise                      → "cut"     (unused AND disable-able)
     """
     t = item["type"]
     if t == "memory":
         return "review"
-    if t == "command":
+    if item.get("invocations_30d", 0) > 0:
+        return "keep"
+    if t == "command" or item.get("scope") == "plugin":
         return "review"
-    if item.get("scope") == "plugin":
-        return "review"
-    if t in ("skill", "subagent"):
-        return "cut" if item.get("invocations_30d", 0) == 0 else "keep"
-    if t == "mcp":
-        return "cut" if item.get("invocations_30d", 0) == 0 else "keep"
-    # fallback for unknown types
-    return "review"
+    return "cut"
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +416,7 @@ def verdict_for_item(item: Item) -> str:
 # ---------------------------------------------------------------------------
 
 _SUMMARY_CUT_CAP = 40
+_SUMMARY_REVIEW_CAP = 30
 
 
 def build_summary(items: list[Item], earliest, now) -> dict:
@@ -381,11 +429,12 @@ def build_summary(items: list[Item], earliest, now) -> dict:
             "cut": [ {type,name,scope,tokens,calls_all,last_used}, ... ],
             "cut_truncated": 0,
             "review": [ {type,name,tokens}, ... ],
+            "review_truncated": 0,
             "kept": {"count": int, "tokens": int},
         }
 
     ``cut`` is sorted by tokens desc (null last), capped at 40 items.
-    ``review`` is sorted by tokens desc.
+    ``review`` is sorted by tokens desc, capped at 30 items.
     ``kept`` is aggregated (count + summed tokens) — not listed.
     """
     # Reuse build_output for totals (it also sorts items, which we ignore here)
@@ -424,14 +473,17 @@ def build_summary(items: list[Item], earliest, now) -> dict:
     cut_truncated = max(0, len(cut_sorted) - _SUMMARY_CUT_CAP)
     cut_list = cut_sorted[:_SUMMARY_CUT_CAP]
 
-    # Sort review by tokens desc (None last)
+    # Sort review by tokens desc (None last), cap at _SUMMARY_REVIEW_CAP
     review_sorted = sorted(review_raw, key=lambda x: (x["tokens"] is None, -(x["tokens"] or 0)))
+    review_truncated = max(0, len(review_sorted) - _SUMMARY_REVIEW_CAP)
+    review_list = review_sorted[:_SUMMARY_REVIEW_CAP]
 
     return {
         "totals": totals,
         "cut": cut_list,
         "cut_truncated": cut_truncated,
-        "review": review_sorted,
+        "review": review_list,
+        "review_truncated": review_truncated,
         "kept": {"count": kept_count, "tokens": kept_tokens},
     }
 
@@ -471,6 +523,8 @@ def _enumerate_and_merge(home: Path, project: Path, now: datetime) -> tuple[list
     items: list[Item] = []
     items += collect_skills(home, project)
     items += collect_plugin_skills(home)
+    items += collect_plugin_agents(home)
+    items += collect_plugin_commands(home)
     items += collect_md_items(home / ".claude" / "agents", "subagent", "user")
     items += collect_md_items(project / ".claude" / "agents", "subagent", "project")
     items += collect_md_items(home / ".claude" / "commands", "command", "user")

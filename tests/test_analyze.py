@@ -1144,5 +1144,284 @@ class TestMainCLIOutput(unittest.TestCase):
         self.assertEqual(summary["kept"]["count"], 1)
 
 
+# ---------------------------------------------------------------------------
+# Fix A: verdict_for_item — USAGE-FIRST (used plugin skills → keep)
+# ---------------------------------------------------------------------------
+
+class TestVerdictForItemFixA(unittest.TestCase):
+    """Fix A: used plugin skills must count as 'keep', not 'review'."""
+
+    def test_used_plugin_skill_keep(self):
+        """A plugin skill with invocations_30d > 0 must be 'keep'."""
+        item = _merged_item("skill", "coolskill", "plugin", 20, invocations_30d=3)
+        self.assertEqual(analyze.verdict_for_item(item), "keep")
+
+    def test_unused_plugin_skill_review(self):
+        """An unused plugin skill must still be 'review' (not individually disable-able)."""
+        item = _merged_item("skill", "coolskill", "plugin", 20, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "review")
+
+    def test_used_user_skill_keep(self):
+        """A user-scoped skill with usage is 'keep'."""
+        item = _merged_item("skill", "my-skill", "user", 50, invocations_30d=1)
+        self.assertEqual(analyze.verdict_for_item(item), "keep")
+
+    def test_unused_user_skill_cut(self):
+        """An unused user-scoped skill is 'cut'."""
+        item = _merged_item("skill", "my-skill", "user", 50, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "cut")
+
+    def test_command_zero_usage_review(self):
+        """A command with 0 usage is 'review' (usage not tracked)."""
+        item = _merged_item("command", "daily-cmd", "user", 60, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "review")
+
+    def test_memory_review_regardless_of_usage(self):
+        """Memory is always 'review'."""
+        item = _merged_item("memory", "CLAUDE.md", "user", 300, invocations_30d=5)
+        self.assertEqual(analyze.verdict_for_item(item), "review")
+
+    def test_unused_mcp_cut(self):
+        """Unused mcp (non-plugin, non-command, non-memory) → cut."""
+        item = _merged_item("mcp", "ghost", "user", None, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "cut")
+
+    def test_used_mcp_keep(self):
+        """Used mcp → keep."""
+        item = _merged_item("mcp", "active-srv", "user", None, invocations_30d=2)
+        self.assertEqual(analyze.verdict_for_item(item), "keep")
+
+
+# ---------------------------------------------------------------------------
+# Fix A2: build_output reclaimable must NOT include unused plugin skills
+# ---------------------------------------------------------------------------
+
+class TestBuildOutputFixA2(unittest.TestCase):
+    """Fix A2: reclaimable_est and unused_mcp_count must be based on verdict=='cut'."""
+
+    def test_unused_plugin_skill_not_in_reclaimable(self):
+        """An unused plugin skill (verdict='review') must NOT contribute to reclaimable_est."""
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        items = [
+            _merged_item("skill", "user-unused", "user", 80, invocations_30d=0),     # cut → reclaimable
+            _merged_item("skill", "plugin-unused", "plugin", 40, invocations_30d=0), # review → NOT reclaimable
+        ]
+        out = analyze.build_output(items, None, now)
+        # Only the user-unused skill (80 tokens) should count
+        self.assertEqual(out["totals"]["reclaimable_est"], 80)
+
+    def test_unused_user_skill_in_reclaimable(self):
+        """An unused user skill (verdict='cut') must contribute to reclaimable_est."""
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        items = [_merged_item("skill", "cold-skill", "user", 60, invocations_30d=0)]
+        out = analyze.build_output(items, None, now)
+        self.assertEqual(out["totals"]["reclaimable_est"], 60)
+
+    def test_used_plugin_skill_not_in_reclaimable(self):
+        """A used plugin skill (verdict='keep') must NOT contribute to reclaimable_est."""
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        items = [_merged_item("skill", "active-plugin", "plugin", 100, invocations_30d=5)]
+        out = analyze.build_output(items, None, now)
+        self.assertEqual(out["totals"]["reclaimable_est"], 0)
+
+    def test_unused_mcp_count_via_verdict(self):
+        """unused_mcp_count must count only MCP items with verdict=='cut'."""
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        items = [
+            _merged_item("mcp", "used-srv", "user", None, invocations_30d=1),   # keep
+            _merged_item("mcp", "cold-srv", "user", None, invocations_30d=0),   # cut
+        ]
+        out = analyze.build_output(items, None, now)
+        self.assertEqual(out["totals"]["unused_mcp_count"], 1)
+
+
+# ---------------------------------------------------------------------------
+# Fix B: collect_plugin_agents / collect_plugin_commands
+# ---------------------------------------------------------------------------
+
+def _write_plugin_md(home, market, plugin, version, folder, filename, description, body="body"):
+    """Helper to write a .md file inside a plugin folder."""
+    parent_dir = (
+        home / ".claude" / "plugins" / market / plugin / version / folder
+    )
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    md = parent_dir / filename
+    md.write_text(f"---\ndescription: {description}\n---\n{body}\n")
+    return md
+
+
+class TestCollectPluginAgents(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_collect_plugin_agents_basic(self):
+        """An agents/helper.md inside a plugin emits type=subagent, scope=plugin."""
+        home = self.tmp_path / "home"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "agents", "helper.md", "helps things")
+        items = analyze.collect_plugin_agents(home)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertEqual(it["name"], "helper")
+        self.assertEqual(it["type"], "subagent")
+        self.assertEqual(it["scope"], "plugin")
+        self.assertGreater(it["persistent_tokens_est"], 0)
+        self.assertEqual(it["cost_basis"], "estimated")
+
+    def test_collect_plugin_agents_no_plugins_dir(self):
+        """Returns [] when plugins dir is absent."""
+        home = self.tmp_path / "home"
+        home.mkdir()
+        self.assertEqual(analyze.collect_plugin_agents(home), [])
+
+    def test_collect_plugin_agents_ignores_non_agents_dirs(self):
+        """Files in 'skills' or 'commands' dirs must NOT be included."""
+        home = self.tmp_path / "home"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "skills", "SKILL.md", "a skill")
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "commands", "do.md", "a cmd")
+        items = analyze.collect_plugin_agents(home)
+        self.assertEqual(items, [])
+
+    def test_collect_plugin_agents_dedup(self):
+        """Two identical source paths produce only one item."""
+        home = self.tmp_path / "home"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "agents", "helper.md", "desc")
+        # Call twice but dedup should be internal
+        items = analyze.collect_plugin_agents(home)
+        self.assertEqual(len(items), 1)
+
+
+class TestCollectPluginCommands(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_collect_plugin_commands_basic(self):
+        """A commands/do-thing.md inside a plugin emits type=command, scope=plugin."""
+        home = self.tmp_path / "home"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "commands", "do-thing.md", "does things")
+        items = analyze.collect_plugin_commands(home)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertEqual(it["name"], "do-thing")
+        self.assertEqual(it["type"], "command")
+        self.assertEqual(it["scope"], "plugin")
+        self.assertGreater(it["persistent_tokens_est"], 0)
+        self.assertEqual(it["cost_basis"], "estimated")
+
+    def test_collect_plugin_commands_no_plugins_dir(self):
+        """Returns [] when plugins dir is absent."""
+        home = self.tmp_path / "home"
+        home.mkdir()
+        self.assertEqual(analyze.collect_plugin_commands(home), [])
+
+    def test_collect_plugin_commands_ignores_non_commands_dirs(self):
+        """Files in 'skills' or 'agents' dirs must NOT be included."""
+        home = self.tmp_path / "home"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "skills", "SKILL.md", "a skill")
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "agents", "helper.md", "an agent")
+        items = analyze.collect_plugin_commands(home)
+        self.assertEqual(items, [])
+
+
+class TestRunAuditIncludesPluginAgentsCommands(unittest.TestCase):
+    """Fix B: run_audit must include plugin agents and commands, routing them to 'review'."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_run_audit_includes_plugin_agent_and_command(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "agents", "helper.md", "an agent")
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "commands", "do-thing.md", "a command")
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        out = analyze.run_audit(home, project, now)
+        names = {i["name"] for i in out["items"]}
+        self.assertIn("helper", names)
+        self.assertIn("do-thing", names)
+
+    def test_plugin_agent_with_zero_usage_is_review_not_cut(self):
+        """Unused plugin agent → verdict 'review', must appear in summary['review'] not cut."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "agents", "helper.md", "an agent desc")
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        summary = analyze.run_summary(home, project, now)
+        review_names = {r["name"] for r in summary["review"]}
+        cut_names = {c["name"] for c in summary["cut"]}
+        self.assertIn("helper", review_names)
+        self.assertNotIn("helper", cut_names)
+
+    def test_plugin_command_with_zero_usage_is_review_not_cut(self):
+        """Unused plugin command → verdict 'review', must appear in summary['review'] not cut."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        _write_plugin_md(home, "mkt", "plug", "1.0.0", "commands", "do-thing.md", "a cmd desc")
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        summary = analyze.run_summary(home, project, now)
+        review_names = {r["name"] for r in summary["review"]}
+        cut_names = {c["name"] for c in summary["cut"]}
+        self.assertIn("do-thing", review_names)
+        self.assertNotIn("do-thing", cut_names)
+
+
+# ---------------------------------------------------------------------------
+# Fix B2: build_summary caps review list at 30 with review_truncated
+# ---------------------------------------------------------------------------
+
+class TestBuildSummaryReviewCap(unittest.TestCase):
+    """Fix B2: review list must be capped at 30, with review_truncated counting overflow."""
+
+    def setUp(self):
+        self.now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+
+    def test_review_capped_at_30_with_truncated_count(self):
+        """With 35 review-worthy items, review has 30 and review_truncated == 5."""
+        # Memory items are always 'review'
+        items = [
+            _merged_item("memory", f"mem-{i}", "user", 10 + i, invocations_30d=0)
+            for i in range(35)
+        ]
+        summary = analyze.build_summary(items, None, self.now)
+        self.assertEqual(len(summary["review"]), 30)
+        self.assertEqual(summary["review_truncated"], 5)
+
+    def test_review_truncated_zero_when_under_cap(self):
+        """With ≤30 review items, review_truncated == 0."""
+        items = [
+            _merged_item("memory", f"mem-{i}", "user", 10, invocations_30d=0)
+            for i in range(10)
+        ]
+        summary = analyze.build_summary(items, None, self.now)
+        self.assertEqual(len(summary["review"]), 10)
+        self.assertEqual(summary["review_truncated"], 0)
+
+    def test_review_truncated_key_always_present(self):
+        """review_truncated must always be present in the summary output."""
+        items = [_merged_item("skill", "s", "user", 10, invocations_30d=1)]
+        summary = analyze.build_summary(items, None, self.now)
+        self.assertIn("review_truncated", summary)
+
+    def test_summary_has_required_keys_including_review_truncated(self):
+        """build_summary must include review_truncated in its output keys."""
+        items = [_merged_item("memory", "CLAUDE.md", "user", 100, invocations_30d=0)]
+        summary = analyze.build_summary(items, None, self.now)
+        for key in ("totals", "cut", "cut_truncated", "review", "review_truncated", "kept"):
+            self.assertIn(key, summary)
+
+
 if __name__ == "__main__":
     unittest.main()
