@@ -297,3 +297,49 @@ def build_output(items: list[Item], earliest, now) -> dict:
         },
         "items": ordered,
     }
+
+
+# ---------------------------------------------------------------------------
+# Task 8: run_audit / main (CLI)
+# ---------------------------------------------------------------------------
+
+def run_audit(home: Path, project: Path, now: datetime) -> dict:
+    items: list[Item] = []
+    items += collect_skills(home, project)
+    items += collect_md_items(home / ".claude" / "agents", "subagent", "user")
+    items += collect_md_items(project / ".claude" / "agents", "subagent", "project")
+    items += collect_md_items(home / ".claude" / "commands", "command", "user")
+    items += collect_md_items(project / ".claude" / "commands", "command", "project")
+    items += collect_memory(home, project)
+    items += collect_mcp_servers(home, project)
+    usage, earliest = parse_usage(home / ".claude" / "projects", now)
+    merge_usage(items, usage)
+    return build_output(items, earliest, now)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Audit Claude Code context cost vs. usage.")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("audit", help="(default) print a JSON audit")
+    for cmd in ("disable", "undo"):
+        p = sub.add_parser(cmd)
+        p.add_argument("item_type", choices=["skill", "subagent", "command", "mcp"])
+        p.add_argument("name")
+    args = parser.parse_args(argv)
+
+    home = Path.home()
+    project = Path.cwd()
+    disabled_root = home / ".claude" / DISABLED_DIRNAME
+
+    if args.cmd == "disable":
+        print(json.dumps(disable_item(args.item_type, args.name, home, project, disabled_root), indent=2))
+    elif args.cmd == "undo":
+        print(json.dumps(undo_item(args.item_type, args.name, home, project, disabled_root), indent=2))
+    else:
+        now = datetime.now(timezone.utc)
+        print(json.dumps(run_audit(home, project, now), indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
