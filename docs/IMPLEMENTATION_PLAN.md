@@ -6,7 +6,7 @@
 
 **Architecture:** A pure-stdlib `scripts/analyze.py` (the "cruncher") enumerates config and parses session-transcript `tool_use` history into a compact JSON summary; `SKILL.md` (the "brain") tells Claude to run it and reason over the small output. Script crunches, agent advises — so auditing context doesn't itself bloat context.
 
-**Tech Stack:** Python 3.11+ (stdlib only: `json`, `pathlib`, `glob`, `datetime`, `argparse`, `collections`, `re`, `shutil`). Tests: `pytest` (dev-only dependency; the shipped tool needs nothing).
+**Tech Stack:** Python 3.9+ (stdlib only: `json`, `pathlib`, `glob`, `datetime`, `argparse`, `collections`, `re`, `shutil`). Tests: `pytest` (dev-only dependency; the shipped tool needs nothing).
 
 ---
 

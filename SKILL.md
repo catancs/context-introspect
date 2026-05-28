@@ -21,6 +21,7 @@ Audit the user's own Claude Code config — which MCP servers, skills, subagents
    - `scope: "plugin"` skills are managed by their plugin: surface their cost but do NOT offer to disable them (the user removes the plugin instead).
    - `persistent_tokens_est` is paid every turn; prioritise high-persistent + zero-usage items.
    - `cost_basis: "unknown-v1"` (all MCP servers): the per-server token cost is NOT measured in v1 — say so plainly. Flag unused MCP servers by usage, and note MCP schemas can cost thousands of tokens per turn.
+   - `type: "command"` (slash commands): usage is NOT tracked in v1, so commands always show 0 calls. Judge them by cost only, like memory — NEVER flag a command as a CUT candidate based on its (always-zero) usage.
    - Spot **redundancy**: items whose names/descriptions overlap (e.g. two GitHub MCP servers, where only one is ever called).
 
 3. **Present the report:**
@@ -36,6 +37,6 @@ Audit the user's own Claude Code config — which MCP servers, skills, subagents
 ## Rules
 
 - NEVER delete. Disabling is reversible; always surface the printed undo command.
-- NEVER recommend cutting an item used in any project, any `memory` item, any `plugin`-scoped skill, or this skill itself.
+- NEVER recommend cutting an item used in any project, any `memory` item, any `command` item (command usage isn't tracked in v1), any `plugin`-scoped skill, or this skill itself.
 - Always label token figures as estimates; never present an estimate as measured.
 - If transcript history is thin, say usage data is limited rather than over-claiming "unused."
