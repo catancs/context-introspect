@@ -130,3 +130,50 @@ def collect_memory(home: Path, project: Path) -> list[Item]:
         (project / "CLAUDE.md", "CLAUDE.md (project-root)"),
     ]
     return [it for path, label in candidates if (it := _memory_item(path, label))]
+
+
+# ---------------------------------------------------------------------------
+# Task 5: collect_mcp_servers
+# ---------------------------------------------------------------------------
+
+def _load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _mcp_item(name: str, scope: str, source_path: str) -> Item:
+    return {
+        "type": "mcp",
+        "name": name,
+        "scope": scope,
+        "persistent_tokens_est": None,   # not measurable in v1
+        "ondemand_tokens_est": 0,
+        "cost_basis": "unknown-v1",
+        "source_path": source_path,
+    }
+
+
+def collect_mcp_servers(home: Path, project: Path) -> list[Item]:
+    items: list[Item] = []
+    seen: set[str] = set()
+
+    def add(servers: dict, scope: str, src: str):
+        for name in (servers or {}):
+            if name not in seen:
+                seen.add(name)
+                items.append(_mcp_item(name, scope, src))
+
+    claude_json = home / ".claude.json"
+    if claude_json.exists():
+        data = _load_json(claude_json)
+        add(data.get("mcpServers", {}), "user", str(claude_json))
+        for proj_cfg in (data.get("projects", {}) or {}).values():
+            add(proj_cfg.get("mcpServers", {}), "project", str(claude_json))
+
+    mcp_json = project / ".mcp.json"
+    if mcp_json.exists():
+        add(_load_json(mcp_json).get("mcpServers", {}), "project", str(mcp_json))
+
+    return items
