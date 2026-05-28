@@ -22,15 +22,16 @@ Audit the user's own Claude Code config — which MCP servers, skills, subagents
      "cut":    [ { "type", "name", "scope", "tokens", "calls_all", "last_used" } ],
      "cut_truncated": 0,
      "review": [ { "type", "name", "tokens" } ],
+     "review_truncated": 0,
      "kept":   { "count", "tokens" }
    }
    ```
 
 2. **Reason over the digest:**
    - `cut` — items the analyzer judged unused (skills/subagents with 0 calls in 30 days, and MCP servers never invoked). These are the disable candidates. For `type: "mcp"`, `tokens` is `null` — flag it as unused but say its token cost isn't measured in v1.
-   - `review` — memory files (CLAUDE.md/MEMORY.md), slash commands, and plugin-provided skills. Judge these by size only; NEVER auto-cut them.
-   - `kept` — a count + token sum of actively-used items. Summarize it; don't list them.
-   - `cut_truncated > 0` → say there are that many more low-value items beyond the top ones shown.
+   - `review` — memory files (CLAUDE.md/MEMORY.md), slash commands, and plugin-provided skills/agents/commands that are unused. Judge these by size only; NEVER auto-cut them. For unused plugin items, note that removing the plugin is how to reclaim them.
+   - `kept` — a count + token sum of actively-used items (including plugin skills the user actually invokes). Summarize it; don't list them.
+   - `cut_truncated`/`review_truncated > 0` → say there are that many more items beyond the top ones shown.
    - Spot **redundancy** among the `cut`/`review` names (e.g. two GitHub MCP servers where only one is ever called).
 
 3. **Present the report:**

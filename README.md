@@ -17,9 +17,9 @@ There's already a tool, `unclog`, that does part of this. But it's a separate CL
 
 You ask Claude **"audit my context."** It runs a small analyzer and comes back with something like:
 
-> Your setup costs ~4,800 tokens/turn (estimated). ~3,200 of that is from skills you haven't called in 30 days, plus 3 MCP servers that were never invoked.
+> Your setup costs ~8,900 tokens/turn (estimated) before you type a word — and you actively use about a tenth of it. The rest splits three ways: unused skills and subagents you can disable on the spot (~600 tokens), plugins you'd reclaim by uninstalling, and MCP servers you've never once called (whose per-turn schema cost isn't measured yet, but is usually the single biggest win).
 
-Then a ranked table — what to keep, what to cut, and why — and an offer to disable the dead weight for you. Reversibly.
+Then a ranked table — what to keep, what to cut, and why — and an offer to disable the *disable-able* dead weight for you. Reversibly. (Plugin-managed items it flags but won't touch — it tells you to remove the plugin instead.)
 
 ## What "auditing your own context" actually means in practice
 
