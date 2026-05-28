@@ -177,3 +177,69 @@ def collect_mcp_servers(home: Path, project: Path) -> list[Item]:
         add(_load_json(mcp_json).get("mcpServers", {}), "project", str(mcp_json))
 
     return items
+
+
+# ---------------------------------------------------------------------------
+# Task 6: keys_for_tool / parse_usage
+# ---------------------------------------------------------------------------
+
+def keys_for_tool(name: str, tool_input: dict) -> list[tuple]:
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        if len(parts) >= 2 and parts[1]:
+            return [("mcp", parts[1])]
+        return []
+    if name == "Skill":
+        s = tool_input.get("skill") or tool_input.get("command")
+        return [("skill", s)] if s else []
+    if name in ("Task", "Agent"):
+        st = tool_input.get("subagent_type")
+        return [("subagent", st)] if st else []
+    return []
+
+
+def _iter_tool_uses(obj: dict):
+    msg = obj.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            yield block.get("name", ""), (block.get("input") or {})
+
+
+def parse_usage(projects_dir: Path, now: datetime) -> tuple[dict, datetime | None]:
+    cutoff = now - timedelta(days=WINDOW_DAYS)
+    usage: dict = defaultdict(lambda: {"all": 0, "30d": 0, "last": None, "projects": set()})
+    earliest: datetime | None = None
+    if not projects_dir.is_dir():
+        return usage, earliest
+
+    for jsonl in projects_dir.glob("*/*.jsonl"):
+        project = jsonl.parent.name
+        try:
+            handle = jsonl.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                ts = parse_ts(obj.get("timestamp"))
+                if ts and (earliest is None or ts < earliest):
+                    earliest = ts
+                for tool_name, tool_input in _iter_tool_uses(obj):
+                    for key in keys_for_tool(tool_name, tool_input):
+                        rec = usage[key]
+                        rec["all"] += 1
+                        if ts and ts >= cutoff:
+                            rec["30d"] += 1
+                        if ts and (rec["last"] is None or ts > rec["last"]):
+                            rec["last"] = ts
+                        rec["projects"].add(project)
+    return usage, earliest
