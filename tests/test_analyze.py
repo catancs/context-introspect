@@ -691,5 +691,147 @@ class TestFix4UndoHintPath(unittest.TestCase):
         self.assertIn("scripts" + os.sep + "analyze.py", undo_cmd)
 
 
+# ---------------------------------------------------------------------------
+# Dogfooding fix A: keys_for_tool normalizes namespaced skill names to bare
+# ---------------------------------------------------------------------------
+
+class TestKeysForToolSkillNormalization(unittest.TestCase):
+    """Fix A: keys_for_tool must strip the namespace prefix for Skill invocations."""
+
+    def test_namespaced_skill_strips_prefix(self):
+        """'superpowers:brainstorming' -> ('skill', 'brainstorming')"""
+        self.assertEqual(
+            analyze.keys_for_tool("Skill", {"skill": "superpowers:brainstorming"}),
+            [("skill", "brainstorming")],
+        )
+
+    def test_bare_skill_name_unchanged(self):
+        """'code-review' -> ('skill', 'code-review') (no colon, no change)"""
+        self.assertEqual(
+            analyze.keys_for_tool("Skill", {"skill": "code-review"}),
+            [("skill", "code-review")],
+        )
+
+    def test_command_field_also_normalised(self):
+        """'gsd:progress' via command field -> ('skill', 'progress')"""
+        self.assertEqual(
+            analyze.keys_for_tool("Skill", {"command": "gsd:progress"}),
+            [("skill", "progress")],
+        )
+
+    def test_document_skills_namespace(self):
+        """'document-skills:xlsx' -> ('skill', 'xlsx')"""
+        self.assertEqual(
+            analyze.keys_for_tool("Skill", {"skill": "document-skills:xlsx"}),
+            [("skill", "xlsx")],
+        )
+
+    def test_parse_usage_with_namespaced_skill_hits_bare_key(self):
+        """End-to-end: a transcript with 'superpowers:brainstorming' must count
+        against the bare key ('skill', 'brainstorming')."""
+        td = tempfile.TemporaryDirectory()
+        tmp = Path(td.name)
+        try:
+            projects = tmp / "projects"
+            now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+            _write_transcript(
+                projects,
+                "-proj",
+                [
+                    _assistant_line(
+                        "2026-05-27T10:00:00Z",
+                        "Skill",
+                        {"skill": "superpowers:brainstorming"},
+                    ),
+                    _assistant_line(
+                        "2026-05-27T11:00:00Z",
+                        "Skill",
+                        {"skill": "brainstorming"},
+                    ),
+                ],
+            )
+            usage, _, _ = analyze.parse_usage(projects, now)
+            rec = usage[("skill", "brainstorming")]
+            self.assertEqual(rec["all"], 2)  # both lines count to the same bare key
+            # The old namespaced key must NOT appear
+            self.assertNotIn(("skill", "superpowers:brainstorming"), usage)
+        finally:
+            td.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Dogfooding fix B: _dedup_items collapses physical duplicate skill copies
+# ---------------------------------------------------------------------------
+
+class TestDedupItems(unittest.TestCase):
+    """Fix B: _dedup_items must collapse (type, name) duplicates, keeping
+    the copy with the largest persistent_tokens_est."""
+
+    def test_dedup_keeps_highest_persistent(self):
+        items = [
+            _item("skill", "xlsx", 10),
+            _item("skill", "xlsx", 30),   # highest -> kept
+            _item("skill", "xlsx", 20),
+            _item("skill", "other", 5),
+        ]
+        result = analyze._dedup_items(items)
+        self.assertEqual(len(result), 2)
+        kept_xlsx = next(i for i in result if i["name"] == "xlsx")
+        self.assertEqual(kept_xlsx["persistent_tokens_est"], 30)
+        self.assertTrue(any(i["name"] == "other" for i in result))
+
+    def test_dedup_none_treated_as_minus_one(self):
+        """When all copies have None for persistent_tokens_est, keep one."""
+        items = [
+            {**_item("skill", "mcp-skill", None), "persistent_tokens_est": None},
+            {**_item("skill", "mcp-skill", None), "persistent_tokens_est": None},
+        ]
+        result = analyze._dedup_items(items)
+        self.assertEqual(len(result), 1)
+
+    def test_dedup_real_number_beats_none(self):
+        """A copy with a real token count must win over one with None."""
+        items = [
+            {**_item("skill", "foo", None), "persistent_tokens_est": None},
+            _item("skill", "foo", 42),
+        ]
+        result = analyze._dedup_items(items)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["persistent_tokens_est"], 42)
+
+    def test_dedup_no_duplicates_unchanged(self):
+        """A list with unique (type, name) pairs passes through untouched."""
+        items = [_item("skill", "a", 1), _item("skill", "b", 2), _item("mcp", "a", 3)]
+        result = analyze._dedup_items(items)
+        self.assertEqual(len(result), 3)
+
+    def test_run_audit_deduplicates_plugin_and_user_skill(self):
+        """If the same skill name exists in both user skills and plugin skills,
+        run_audit must return exactly ONE item for that name (not two)."""
+        td = tempfile.TemporaryDirectory()
+        tmp = Path(td.name)
+        try:
+            home = tmp / "home"
+            project = tmp / "proj"
+            # User skill: "xlsx"
+            _write_skill(home, "xlsx", "user xlsx skill", body="user body")
+            # Plugin skill: also named "xlsx"
+            skill_dir = (
+                home / ".claude" / "plugins"
+                / "somemarket" / "myplugin" / "1.0.0" / "skills" / "xlsx"
+            )
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\ndescription: plugin xlsx skill\n---\nplugin body\n"
+            )
+            now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+            out = analyze.run_audit(home, project, now)
+            xlsx_items = [i for i in out["items"] if i["name"] == "xlsx"]
+            self.assertEqual(len(xlsx_items), 1,
+                             f"Expected 1 xlsx item, got {len(xlsx_items)}: {xlsx_items}")
+        finally:
+            td.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

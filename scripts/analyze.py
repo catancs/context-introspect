@@ -218,7 +218,10 @@ def keys_for_tool(name: str, tool_input: dict) -> list[tuple]:
         return []
     if name == "Skill":
         s = tool_input.get("skill") or tool_input.get("command")
-        return [("skill", s)] if s else []
+        if s:
+            s = s.split(":")[-1]   # "superpowers:brainstorming" -> "brainstorming"
+            return [("skill", s)]
+        return []
     if name in ("Task", "Agent"):
         st = tool_input.get("subagent_type")
         return [("subagent", st)] if st else []
@@ -332,6 +335,29 @@ def build_output(items: list[Item], earliest, now) -> dict:
 # Task 8: run_audit / main (CLI)
 # ---------------------------------------------------------------------------
 
+def _dedup_items(items: list[Item]) -> list[Item]:
+    """Collapse duplicates sharing the same (type, name), keeping one representative.
+
+    The kept copy is the one with the largest ``persistent_tokens_est``; ``None``
+    is treated as -1 so that any real number wins over a missing value.
+    Multiple physical copies of the same plugin skill are the primary source of
+    duplicates — Claude Code loads only one, so summing them would over-count cost.
+    """
+    best: dict[tuple, Item] = {}
+    for item in items:
+        key = (item["type"], item["name"])
+        pt = item.get("persistent_tokens_est")
+        score = pt if pt is not None else -1
+        if key not in best:
+            best[key] = item
+        else:
+            current_pt = best[key].get("persistent_tokens_est")
+            current_score = current_pt if current_pt is not None else -1
+            if score > current_score:
+                best[key] = item
+    return list(best.values())
+
+
 def run_audit(home: Path, project: Path, now: datetime) -> dict:
     items: list[Item] = []
     items += collect_skills(home, project)
@@ -342,6 +368,7 @@ def run_audit(home: Path, project: Path, now: datetime) -> dict:
     items += collect_md_items(project / ".claude" / "commands", "command", "project")
     items += collect_memory(home, project)
     items += collect_mcp_servers(home, project)
+    items = _dedup_items(items)
     usage, earliest, parse_warnings = parse_usage(home / ".claude" / "projects", now)
     merge_usage(items, usage)
     out = build_output(items, earliest, now)
