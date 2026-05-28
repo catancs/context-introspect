@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import subprocess
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -258,6 +261,203 @@ def collect_mcp_servers(home: Path, project: Path) -> list[Item]:
         add(_load_json(mcp_json).get("mcpServers", {}), "project", str(mcp_json))
 
     return items
+
+
+# ---------------------------------------------------------------------------
+# Task 5 v2: _mcp_server_configs / measure_mcp_servers
+# ---------------------------------------------------------------------------
+
+def _mcp_server_configs(home: Path, project: Path) -> dict:
+    """Return {name: config_dict} for every configured MCP server.
+
+    Reads the same locations as collect_mcp_servers:
+      - ~/.claude.json  top-level mcpServers
+      - ~/.claude.json  projects.<path>.mcpServers
+      - <project>/.mcp.json  mcpServers
+    """
+    configs: dict = {}
+    seen: set = set()
+
+    def add(servers: dict, _scope: str):
+        for name, cfg in (servers or {}).items():
+            if name not in seen:
+                seen.add(name)
+                configs[name] = cfg
+
+    claude_json = home / ".claude.json"
+    if claude_json.exists():
+        data = _load_json(claude_json)
+        add(data.get("mcpServers", {}), "user")
+        for proj_cfg in (data.get("projects", {}) or {}).values():
+            add(proj_cfg.get("mcpServers", {}), "project")
+
+    mcp_json = project / ".mcp.json"
+    if mcp_json.exists():
+        add(_load_json(mcp_json).get("mcpServers", {}), "project")
+
+    return configs
+
+
+def _send(proc: subprocess.Popen, msg: dict) -> None:
+    """Write one newline-terminated JSON-RPC message to the process stdin."""
+    line = json.dumps(msg, separators=(",", ":")) + "\n"
+    proc.stdin.write(line)
+    proc.stdin.flush()
+
+
+def _recv_result(proc: subprocess.Popen, expected_id: int, timeout: float) -> dict:
+    """Read lines from proc.stdout until we get a JSON-RPC response with the expected id.
+
+    Uses a background thread so we can enforce a deadline without blocking forever.
+    Returns the parsed response dict, or raises RuntimeError on timeout/error.
+    """
+    result_holder: list = []
+    error_holder: list = []
+
+    def reader():
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == expected_id:
+                    result_holder.append(msg)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            error_holder.append(exc)
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise RuntimeError(f"timeout waiting for response id={expected_id}")
+    if error_holder:
+        raise RuntimeError(f"read error: {error_holder[0]}")
+    if not result_holder:
+        raise RuntimeError("process closed stdout without sending response")
+    return result_holder[0]
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    """Terminate a subprocess, escalating to SIGKILL if needed, and close its pipes."""
+    # Close pipes first so the process sees EOF and is less likely to block.
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_MCP_PROTOCOL_VERSION = "2025-11-25"
+_REMOTE_SKIP_REASON = "remote (not measured in this version)"
+
+
+def measure_mcp_servers(configs: dict, timeout: float = 10.0) -> dict:
+    """Launch each stdio MCP server, perform the JSON-RPC handshake, and count tools.
+
+    Args:
+        configs: {name: config_dict} as returned by _mcp_server_configs.
+        timeout: per-server wall-clock deadline in seconds.
+
+    Returns a dict with keys: measured, skipped, total_measured_tokens, measured_count.
+    """
+    measured: list = []
+    skipped: list = []
+
+    for name, cfg in configs.items():
+        command = cfg.get("command")
+        if not command:
+            # No command → remote/SSE server
+            skipped.append({"name": name, "reason": _REMOTE_SKIP_REASON})
+            continue
+
+        # Build argv
+        argv = [command] + list(cfg.get("args") or [])
+        env = {**os.environ, **(cfg.get("env") or {})}
+
+        proc: subprocess.Popen | None = None
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=env,
+            )
+
+            # Step 1: send initialize
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": _MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "context-introspect", "version": "2.0.0"},
+                },
+            })
+
+            # Step 2: read initialize response (we don't need to validate the version)
+            _recv_result(proc, 1, timeout)
+
+            # Step 3: send notifications/initialized  (notification — no id)
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            })
+
+            # Step 4: send tools/list
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            })
+
+            # Step 5: read tools/list response
+            resp = _recv_result(proc, 2, timeout)
+            if "error" in resp:
+                raise RuntimeError(f"tools/list error: {resp['error']}")
+
+            tools = (resp.get("result") or {}).get("tools") or []
+            token_count = estimate_tokens(json.dumps(tools))
+            measured.append({
+                "name": name,
+                "tokens": token_count,
+                "tool_count": len(tools),
+            })
+
+        except Exception as exc:  # noqa: BLE001
+            skipped.append({"name": name, "reason": str(exc)})
+        finally:
+            if proc is not None:
+                _terminate_proc(proc)
+
+    total = sum(m["tokens"] for m in measured)
+    return {
+        "measured": measured,
+        "skipped": skipped,
+        "total_measured_tokens": total,
+        "measured_count": len(measured),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +919,7 @@ def main(argv=None) -> int:
         p = sub.add_parser(cmd)
         p.add_argument("item_type", choices=["skill", "subagent", "command", "mcp"])
         p.add_argument("name")
+    sub.add_parser("measure-mcp", help="Launch each stdio MCP server and measure real tool token cost")
     # Allow --full at the top level too (when no subcommand is given)
     parser.add_argument("--full", action="store_true", help="Print full item list instead of digest")
     args = parser.parse_args(argv)
@@ -731,6 +932,10 @@ def main(argv=None) -> int:
         print(json.dumps(disable_item(args.item_type, args.name, home, project, disabled_root), indent=2))
     elif args.cmd == "undo":
         print(json.dumps(undo_item(args.item_type, args.name, home, project, disabled_root), indent=2))
+    elif args.cmd == "measure-mcp":
+        configs = _mcp_server_configs(home, project)
+        result = measure_mcp_servers(configs)
+        print(json.dumps(result, separators=(",", ":")))
     else:
         now = datetime.now(timezone.utc)
         full_flag = getattr(args, "full", False)

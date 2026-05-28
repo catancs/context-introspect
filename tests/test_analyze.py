@@ -1423,5 +1423,242 @@ class TestBuildSummaryReviewCap(unittest.TestCase):
             self.assertIn(key, summary)
 
 
+# ---------------------------------------------------------------------------
+# v2: _mcp_server_configs / measure_mcp_servers
+# ---------------------------------------------------------------------------
+
+class TestMcpServerConfigs(unittest.TestCase):
+    """_mcp_server_configs returns raw config dicts keyed by server name."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_reads_top_level_and_project_scoped_and_mcp_json(self):
+        home = self.tmp_path / "home"
+        home.mkdir()
+        project = self.tmp_path / "proj"
+        project.mkdir()
+
+        # ~/.claude.json with top-level + project-scoped entries
+        (home / ".claude.json").write_text(_json.dumps({
+            "mcpServers": {
+                "global-srv": {"command": "g", "args": ["--port", "1234"]},
+            },
+            "projects": {
+                "/some/path": {
+                    "mcpServers": {
+                        "proj-scoped": {"command": "p", "env": {"FOO": "bar"}},
+                    }
+                }
+            },
+        }))
+
+        # project/.mcp.json
+        (project / ".mcp.json").write_text(_json.dumps({
+            "mcpServers": {
+                "local-srv": {"command": "l", "args": []},
+            }
+        }))
+
+        configs = analyze._mcp_server_configs(home, project)
+
+        self.assertIn("global-srv", configs)
+        self.assertIn("proj-scoped", configs)
+        self.assertIn("local-srv", configs)
+        self.assertEqual(configs["global-srv"]["command"], "g")
+        self.assertEqual(configs["global-srv"]["args"], ["--port", "1234"])
+        self.assertEqual(configs["proj-scoped"]["env"], {"FOO": "bar"})
+        self.assertEqual(configs["local-srv"]["command"], "l")
+
+    def test_no_files_returns_empty(self):
+        home = self.tmp_path / "home"
+        home.mkdir()
+        project = self.tmp_path / "proj"
+        project.mkdir()
+        configs = analyze._mcp_server_configs(home, project)
+        self.assertEqual(configs, {})
+
+    def test_deduplicates_same_name_across_sources(self):
+        """If the same server name appears in multiple locations, keep the first occurrence."""
+        home = self.tmp_path / "home"
+        home.mkdir()
+        project = self.tmp_path / "proj"
+        project.mkdir()
+        (home / ".claude.json").write_text(_json.dumps({
+            "mcpServers": {"dup": {"command": "first"}},
+        }))
+        (project / ".mcp.json").write_text(_json.dumps({
+            "mcpServers": {"dup": {"command": "second"}},
+        }))
+        configs = analyze._mcp_server_configs(home, project)
+        # Only one entry; first-seen wins
+        self.assertEqual(len([k for k in configs if k == "dup"]), 1)
+        self.assertEqual(configs["dup"]["command"], "first")
+
+
+class TestMeasureMcpServersSkipsRemote(unittest.TestCase):
+    """measure_mcp_servers skips servers with no 'command' (remote/http/sse)."""
+
+    def test_url_only_server_lands_in_skipped(self):
+        configs = {
+            "remote-srv": {"url": "https://example.com/mcp", "type": "http"},
+        }
+        result = analyze.measure_mcp_servers(configs, timeout=5.0)
+        self.assertEqual(result["measured"], [])
+        self.assertEqual(len(result["skipped"]), 1)
+        skipped = result["skipped"][0]
+        self.assertEqual(skipped["name"], "remote-srv")
+        self.assertIn("remote", skipped["reason"])
+        self.assertEqual(result["measured_count"], 0)
+        self.assertEqual(result["total_measured_tokens"], 0)
+
+    def test_missing_command_lands_in_skipped(self):
+        configs = {
+            "sse-srv": {"type": "sse", "url": "http://localhost:3000"},
+        }
+        result = analyze.measure_mcp_servers(configs, timeout=5.0)
+        self.assertEqual(result["measured"], [])
+        self.assertEqual(result["skipped"][0]["name"], "sse-srv")
+
+
+class TestMeasureMcpServersEndToEnd(unittest.TestCase):
+    """End-to-end handshake test using a fake stdio MCP server script."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _write_fake_server(self, tools: list) -> Path:
+        """Write a minimal MCP stdio server to a temp .py file."""
+        tools_json = _json.dumps(tools, separators=(",", ":"))
+        script = self.tmp_path / "fake_server.py"
+        script.write_text(
+            "import sys, json\n"
+            "tools = " + repr(tools) + "\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line:\n"
+            "        continue\n"
+            "    msg = json.loads(line)\n"
+            "    method = msg.get('method', '')\n"
+            "    msg_id = msg.get('id')\n"
+            "    if method == 'initialize':\n"
+            "        resp = {'jsonrpc': '2.0', 'id': msg_id, 'result': {\n"
+            "            'protocolVersion': '2025-11-25',\n"
+            "            'capabilities': {},\n"
+            "            'serverInfo': {'name': 'fake', 'version': '1.0.0'}\n"
+            "        }}\n"
+            "        sys.stdout.write(json.dumps(resp) + '\\n')\n"
+            "        sys.stdout.flush()\n"
+            "    elif method == 'notifications/initialized':\n"
+            "        pass  # notification, no response\n"
+            "    elif method == 'tools/list':\n"
+            "        resp = {'jsonrpc': '2.0', 'id': msg_id, 'result': {'tools': tools}}\n"
+            "        sys.stdout.write(json.dumps(resp) + '\\n')\n"
+            "        sys.stdout.flush()\n"
+            "        break  # done\n"
+        )
+        return script
+
+    def test_fake_server_with_three_tools(self):
+        """measure_mcp_servers correctly counts 3 fake tools and calculates tokens."""
+        import sys
+        fake_tools = [
+            {"name": "tool_one", "description": "does one thing", "inputSchema": {"type": "object"}},
+            {"name": "tool_two", "description": "does two things", "inputSchema": {"type": "object"}},
+            {"name": "tool_three", "description": "does three things", "inputSchema": {"type": "object"}},
+        ]
+        server_path = self._write_fake_server(fake_tools)
+        configs = {
+            "fake-mcp": {
+                "command": sys.executable,
+                "args": [str(server_path)],
+            }
+        }
+        result = analyze.measure_mcp_servers(configs, timeout=10.0)
+
+        self.assertEqual(result["skipped"], [])
+        self.assertEqual(len(result["measured"]), 1)
+        m = result["measured"][0]
+        self.assertEqual(m["name"], "fake-mcp")
+        self.assertEqual(m["tool_count"], 3)
+        self.assertGreater(m["tokens"], 0)
+        self.assertEqual(result["measured_count"], 1)
+        self.assertEqual(result["total_measured_tokens"], m["tokens"])
+
+        # Verify token count matches estimate_tokens on the serialized tools
+        expected_tokens = analyze.estimate_tokens(_json.dumps(fake_tools))
+        self.assertEqual(m["tokens"], expected_tokens)
+
+    def test_fake_server_zero_tools(self):
+        """A server that advertises no tools returns tool_count=0 and tokens=0."""
+        import sys
+        server_path = self._write_fake_server([])
+        configs = {"empty-mcp": {"command": sys.executable, "args": [str(server_path)]}}
+        result = analyze.measure_mcp_servers(configs, timeout=10.0)
+        self.assertEqual(result["measured"][0]["tool_count"], 0)
+        self.assertEqual(result["measured"][0]["tokens"], 0)
+
+    def test_mixed_stdio_and_remote(self):
+        """With one stdio and one remote server, stdio is measured and remote is skipped."""
+        import sys
+        server_path = self._write_fake_server([
+            {"name": "t1", "description": "a tool", "inputSchema": {"type": "object"}}
+        ])
+        configs = {
+            "real-srv": {"command": sys.executable, "args": [str(server_path)]},
+            "remote-srv": {"url": "https://example.com/mcp"},
+        }
+        result = analyze.measure_mcp_servers(configs, timeout=10.0)
+        measured_names = {m["name"] for m in result["measured"]}
+        skipped_names = {s["name"] for s in result["skipped"]}
+        self.assertIn("real-srv", measured_names)
+        self.assertIn("remote-srv", skipped_names)
+        self.assertEqual(result["measured_count"], 1)
+
+
+class TestMeasureMcpServersTimeout(unittest.TestCase):
+    """A server that hangs or exits immediately lands in skipped and returns promptly."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_server_exits_immediately_goes_to_skipped(self):
+        """A command that exits immediately without sending any output is recorded as skipped."""
+        import sys
+        # A script that just exits with no output
+        script = self.tmp_path / "silent_exit.py"
+        script.write_text("import sys\nsys.exit(0)\n")
+        configs = {"broken-srv": {"command": sys.executable, "args": [str(script)]}}
+        import time
+        start = time.monotonic()
+        result = analyze.measure_mcp_servers(configs, timeout=5.0)
+        elapsed = time.monotonic() - start
+        # Must return promptly (well under the timeout)
+        self.assertLess(elapsed, 5.0)
+        # Server must be in skipped (with some error reason), NOT in measured
+        self.assertEqual(result["measured"], [])
+        self.assertEqual(len(result["skipped"]), 1)
+        self.assertEqual(result["skipped"][0]["name"], "broken-srv")
+
+    def test_nonexistent_command_goes_to_skipped(self):
+        """A server with a command that doesn't exist is recorded as skipped, not a crash."""
+        configs = {"bad-srv": {"command": "/nonexistent/binary/path"}}
+        result = analyze.measure_mcp_servers(configs, timeout=5.0)
+        self.assertEqual(result["measured"], [])
+        self.assertEqual(result["skipped"][0]["name"], "bad-srv")
+
+
 if __name__ == "__main__":
     unittest.main()
