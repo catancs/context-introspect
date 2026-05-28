@@ -243,3 +243,57 @@ def parse_usage(projects_dir: Path, now: datetime) -> tuple[dict, datetime | Non
                             rec["last"] = ts
                         rec["projects"].add(project)
     return usage, earliest
+
+
+# ---------------------------------------------------------------------------
+# Task 7: usage_key_for_item / merge_usage / build_output
+# ---------------------------------------------------------------------------
+
+def usage_key_for_item(item: Item) -> tuple | None:
+    if item["type"] in ("skill", "subagent", "command", "mcp"):
+        return (item["type"], item["name"])
+    return None  # memory is always-loaded, not "invoked"
+
+
+def merge_usage(items: list[Item], usage: dict) -> None:
+    for item in items:
+        key = usage_key_for_item(item)
+        rec = usage.get(key) if key else None
+        if rec:
+            item["invocations_all"] = rec["all"]
+            item["invocations_30d"] = rec["30d"]
+            item["last_used"] = rec["last"].isoformat() if rec["last"] else None
+            item["projects_used"] = sorted(rec["projects"])
+        else:
+            item["invocations_all"] = 0
+            item["invocations_30d"] = 0
+            item["last_used"] = None
+            item["projects_used"] = []
+
+
+def build_output(items: list[Item], earliest, now) -> dict:
+    def persistent(i):
+        return i["persistent_tokens_est"] or 0
+
+    context_tax = sum(persistent(i) for i in items)
+    reclaimable = sum(
+        persistent(i) for i in items
+        if i["type"] != "memory"
+        and i["persistent_tokens_est"] is not None
+        and i["invocations_30d"] == 0
+    )
+    unused_mcp = sum(1 for i in items if i["type"] == "mcp" and i["invocations_30d"] == 0)
+    horizon = (now - earliest).days if earliest else 0
+
+    ordered = sorted(items, key=lambda i: (-persistent(i), i["invocations_30d"]))
+    return {
+        "totals": {
+            "context_tax_est": context_tax,
+            "reclaimable_est": reclaimable,
+            "unused_mcp_count": unused_mcp,
+            "history_horizon_days": horizon,
+            "note": "Token figures are estimates (chars/4). MCP per-server cost is not "
+                    "measured in v1; unused MCP servers are identified by usage only.",
+        },
+        "items": ordered,
+    }
