@@ -332,6 +332,111 @@ def build_output(items: list[Item], earliest, now) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Change 1: verdict_for_item
+# ---------------------------------------------------------------------------
+
+def verdict_for_item(item: Item) -> str:
+    """Return "cut" | "keep" | "review" for a fully-merged item.
+
+    Rules (in priority order):
+    - type == "memory"         → "review"  (always-loaded; judged by size)
+    - type == "command"        → "review"  (usage not tracked in v1)
+    - scope == "plugin"        → "review"  (managed by its plugin)
+    - type in skill/subagent, not plugin:
+        invocations_30d == 0   → "cut"
+        else                   → "keep"
+    - type == "mcp":
+        invocations_30d == 0   → "cut"
+        else                   → "keep"
+    """
+    t = item["type"]
+    if t == "memory":
+        return "review"
+    if t == "command":
+        return "review"
+    if item.get("scope") == "plugin":
+        return "review"
+    if t in ("skill", "subagent"):
+        return "cut" if item.get("invocations_30d", 0) == 0 else "keep"
+    if t == "mcp":
+        return "cut" if item.get("invocations_30d", 0) == 0 else "keep"
+    # fallback for unknown types
+    return "review"
+
+
+# ---------------------------------------------------------------------------
+# Change 2: build_summary
+# ---------------------------------------------------------------------------
+
+_SUMMARY_CUT_CAP = 40
+
+
+def build_summary(items: list[Item], earliest, now) -> dict:
+    """Return a compact, decision-ready digest.
+
+    Shape::
+
+        {
+            "totals": { ... },           # same as build_output produces
+            "cut": [ {type,name,scope,tokens,calls_all,last_used}, ... ],
+            "cut_truncated": 0,
+            "review": [ {type,name,tokens}, ... ],
+            "kept": {"count": int, "tokens": int},
+        }
+
+    ``cut`` is sorted by tokens desc (null last), capped at 40 items.
+    ``review`` is sorted by tokens desc.
+    ``kept`` is aggregated (count + summed tokens) — not listed.
+    """
+    # Reuse build_output for totals (it also sorts items, which we ignore here)
+    full = build_output(items, earliest, now)
+    totals = full["totals"]
+
+    cut_raw: list[dict] = []
+    review_raw: list[dict] = []
+    kept_count = 0
+    kept_tokens = 0
+
+    for item in items:
+        v = verdict_for_item(item)
+        tokens = item.get("persistent_tokens_est")
+        if v == "cut":
+            cut_raw.append({
+                "type": item["type"],
+                "name": item["name"],
+                "scope": item.get("scope"),
+                "tokens": tokens,
+                "calls_all": item.get("invocations_all", 0),
+                "last_used": item.get("last_used"),
+            })
+        elif v == "review":
+            review_raw.append({
+                "type": item["type"],
+                "name": item["name"],
+                "tokens": tokens,
+            })
+        else:  # "keep"
+            kept_count += 1
+            kept_tokens += tokens if tokens is not None else 0
+
+    # Sort cut by tokens desc (None last)
+    cut_sorted = sorted(cut_raw, key=lambda x: (x["tokens"] is None, -(x["tokens"] or 0)))
+    cut_truncated = max(0, len(cut_sorted) - _SUMMARY_CUT_CAP)
+    cut_list = cut_sorted[:_SUMMARY_CUT_CAP]
+
+    # Sort review by tokens desc (None last)
+    review_sorted = sorted(review_raw, key=lambda x: (x["tokens"] is None, -(x["tokens"] or 0)))
+
+    return {
+        "totals": totals,
+        "cut": cut_list,
+        "cut_truncated": cut_truncated,
+        "review": review_sorted,
+        "kept": {"count": kept_count, "tokens": kept_tokens},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Task 8: run_audit / main (CLI)
 # ---------------------------------------------------------------------------
 
@@ -358,7 +463,11 @@ def _dedup_items(items: list[Item]) -> list[Item]:
     return list(best.values())
 
 
-def run_audit(home: Path, project: Path, now: datetime) -> dict:
+def _enumerate_and_merge(home: Path, project: Path, now: datetime) -> tuple[list[Item], "datetime | None", int]:
+    """Collect, dedup, parse usage, merge, and return (items, earliest, parse_warnings).
+
+    Shared by run_audit and the summary path so collection is not duplicated.
+    """
     items: list[Item] = []
     items += collect_skills(home, project)
     items += collect_plugin_skills(home)
@@ -371,7 +480,20 @@ def run_audit(home: Path, project: Path, now: datetime) -> dict:
     items = _dedup_items(items)
     usage, earliest, parse_warnings = parse_usage(home / ".claude" / "projects", now)
     merge_usage(items, usage)
+    return items, earliest, parse_warnings
+
+
+def run_audit(home: Path, project: Path, now: datetime) -> dict:
+    items, earliest, parse_warnings = _enumerate_and_merge(home, project, now)
     out = build_output(items, earliest, now)
+    out["totals"]["parse_warnings"] = parse_warnings
+    return out
+
+
+def run_summary(home: Path, project: Path, now: datetime) -> dict:
+    """Return the compact digest produced by build_summary."""
+    items, earliest, parse_warnings = _enumerate_and_merge(home, project, now)
+    out = build_summary(items, earliest, now)
     out["totals"]["parse_warnings"] = parse_warnings
     return out
 
@@ -537,11 +659,14 @@ def undo_item(item_type: str, name: str, home: Path, project: Path, disabled_roo
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Audit Claude Code context cost vs. usage.")
     sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("audit", help="(default) print a JSON audit")
+    audit_p = sub.add_parser("audit", help="(default) print a compact JSON summary")
+    audit_p.add_argument("--full", action="store_true", help="Print full item list instead of digest")
     for cmd in ("disable", "undo"):
         p = sub.add_parser(cmd)
         p.add_argument("item_type", choices=["skill", "subagent", "command", "mcp"])
         p.add_argument("name")
+    # Allow --full at the top level too (when no subcommand is given)
+    parser.add_argument("--full", action="store_true", help="Print full item list instead of digest")
     args = parser.parse_args(argv)
 
     home = Path.home()
@@ -554,7 +679,11 @@ def main(argv=None) -> int:
         print(json.dumps(undo_item(args.item_type, args.name, home, project, disabled_root), indent=2))
     else:
         now = datetime.now(timezone.utc)
-        print(json.dumps(run_audit(home, project, now), indent=2, default=str))
+        full_flag = getattr(args, "full", False)
+        if full_flag:
+            print(json.dumps(run_audit(home, project, now), indent=2, default=str))
+        else:
+            print(json.dumps(run_summary(home, project, now), default=str))
     return 0
 
 
