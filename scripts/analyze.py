@@ -317,6 +317,81 @@ def run_audit(home: Path, project: Path, now: datetime) -> dict:
     return build_output(items, earliest, now)
 
 
+# ---------------------------------------------------------------------------
+# Task 9: disable_item / undo_item
+# ---------------------------------------------------------------------------
+
+def _file_source(item_type: str, name: str, home: Path, project: Path) -> Path | None:
+    if item_type == "skill":
+        for root in (home, project):
+            d = root / ".claude" / "skills" / name
+            if d.exists():
+                return d
+    elif item_type in ("subagent", "command"):
+        sub = "agents" if item_type == "subagent" else "commands"
+        for root in (home, project):
+            f = root / ".claude" / sub / f"{name}.md"
+            if f.exists():
+                return f
+    return None
+
+
+def _store(disabled_root: Path, item_type: str, name: str) -> Path:
+    return disabled_root / item_type / name
+
+
+def disable_item(item_type: str, name: str, home: Path, project: Path, disabled_root: Path) -> dict:
+    if item_type == "mcp":
+        cj = home / ".claude.json"
+        data = _load_json(cj)
+        servers = data.get("mcpServers", {})
+        if name not in servers:
+            return {"ok": False, "error": f"MCP server '{name}' not found in {cj}"}
+        backup = disabled_root / f"claude.json.{int(datetime.now().timestamp())}.bak"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cj, backup)
+        removed = servers.pop(name)
+        store = _store(disabled_root, "mcp", name)
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "server.json").write_text(json.dumps({"name": name, "config": removed}, indent=2))
+        cj.write_text(json.dumps(data, indent=2))
+        return {"ok": True, "disabled": name,
+                "undo": f"python3 analyze.py undo mcp {name}", "backup": str(backup)}
+
+    src = _file_source(item_type, name, home, project)
+    if not src:
+        return {"ok": False, "error": f"{item_type} '{name}' not found"}
+    dest = _store(disabled_root, item_type, name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    (dest.parent / f"{name}.origin").write_text(str(src))
+    return {"ok": True, "disabled": name, "undo": f"python3 analyze.py undo {item_type} {name}"}
+
+
+def undo_item(item_type: str, name: str, home: Path, project: Path, disabled_root: Path) -> dict:
+    if item_type == "mcp":
+        store = _store(disabled_root, "mcp", name) / "server.json"
+        if not store.exists():
+            return {"ok": False, "error": f"no disabled MCP server '{name}'"}
+        saved = json.loads(store.read_text())
+        cj = home / ".claude.json"
+        data = _load_json(cj)
+        data.setdefault("mcpServers", {})[name] = saved["config"]
+        cj.write_text(json.dumps(data, indent=2))
+        shutil.rmtree(_store(disabled_root, "mcp", name))
+        return {"ok": True, "restored": name}
+
+    dest = _store(disabled_root, item_type, name)
+    origin_file = dest.parent / f"{name}.origin"
+    if not dest.exists() or not origin_file.exists():
+        return {"ok": False, "error": f"no disabled {item_type} '{name}'"}
+    original = Path(origin_file.read_text().strip())
+    original.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(dest), str(original))
+    origin_file.unlink()
+    return {"ok": True, "restored": name}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Audit Claude Code context cost vs. usage.")
     sub = parser.add_subparsers(dest="cmd")
