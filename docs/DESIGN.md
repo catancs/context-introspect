@@ -66,11 +66,13 @@ The irony to avoid: a pure-markdown skill would make Claude read giant transcrip
 
 **Definitions:** `context_tax_est` = sum of `persistent_tokens_est` (cost paid every turn before you type). `reclaimable_est` = persistent cost of items verdicted CUT. Exact transcript field names (e.g. the `Skill` tool's skill-name key) are confirmed against real transcripts during implementation, not assumed.
 
-### 4b. Reversible disable (`--disable <type> <name>`)
+### 4b. Reversible disable (`disable <type> <name>` / `undo <type> <name>` subcommands)
 
 - **File-based** (skill/subagent/command): move into `~/.claude/.context-introspect-disabled/<type>/<name>/`, preserving a `.origin` note with the original absolute path.
-- **Config-based** (MCP server): timestamped backup of the JSON first, then lift the entry out into `~/.claude/.context-introspect-disabled/mcp-servers.json` (recording its original location/scope).
-- **Always:** back up before edits, never delete, print the exact undo command. An `--undo <type> <name>` restores from the disabled store.
+- **Config-based** (MCP server): timestamped backup of the JSON first, then lift the entry out into `~/.claude/.context-introspect-disabled/mcp/<name>/server.json` (recording its original file + project key for exact restore).
+- **Always:** back up before edits, never delete, print the exact undo command. `undo <type> <name>` restores from the disabled store.
+
+**Known v1 limitations:** slash-command usage is not tracked (commands are judged by cost only, never flagged unused); MCP per-server token cost is not measured (v2); when the same skill name exists in both user and project scope, the higher-cost copy is the one reported and disabled.
 
 ## 5. The report (what the user sees)
 

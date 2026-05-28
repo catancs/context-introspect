@@ -36,6 +36,8 @@ Run on a real, heavily-used setup:
 | pptx | skill | 173 | 0 / 0 | ✂️ CUT |
 | hook-development | skill | 131 | 0 / 0 | ✂️ CUT |
 
+*(Excerpt — top items from a real run on the author's setup; 65 items total.)*
+
 Then, only if you confirm:
 
 ```
@@ -47,7 +49,7 @@ $ python3 .../analyze.py disable skill pptx
 
 A tiny `scripts/analyze.py` (pure stdlib, zero install) enumerates your config and parses your session transcripts (`~/.claude/projects/*/*.jsonl`) into a compact JSON summary; `SKILL.md` tells Claude to run it and reason over the result. **Script crunches, agent advises** — so auditing your context doesn't itself bloat your context.
 
-Honesty notes: token figures are estimates (`~chars/4`). Per-MCP-server token cost is **not** measured in v1 (unused MCP servers are identified by usage); measuring it exactly is the v2 headline.
+Honesty notes: token figures are estimates (`~chars/4`). Per-MCP-server token cost is **not** measured in v1 (unused MCP servers are identified by usage); measuring it exactly is the v2 headline. Slash-command usage isn't tracked in v1 either, so commands are judged by cost only — never flagged unused.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
