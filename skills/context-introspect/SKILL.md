@@ -9,34 +9,44 @@ Audit the user's own Claude Code config — which MCP servers, skills, subagents
 
 ## Procedure
 
-1. **Run the analyzer. Do NOT read transcripts or config yourself** — that would bloat this very context. The script crunches; you advise.
+1. **Run the analyzer. Do NOT read transcripts or config yourself, and do NOT pass `--full`** — the default output is a small, pre-digested summary on purpose (reading raw data would bloat the very context you're auditing). The script crunches and judges; you reason and present.
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/analyze.py"
    ```
-   (`${CLAUDE_PLUGIN_ROOT}` is set by Claude Code when this skill runs from an installed plugin. If it's unset — e.g. a manual install — use the absolute path to `scripts/analyze.py` in this skill's repo.) It prints compact JSON: `{ "totals": {...}, "items": [...] }`.
+   `${CLAUDE_PLUGIN_ROOT}` is set when this runs from an installed plugin. If it's unset (e.g. running from the repo, un-installed), the script is at the plugin/repo root's `scripts/analyze.py` — i.e. two directories up from this SKILL.md.
 
-2. **Reason over the JSON:**
-   - `invocations_30d == 0` → a CUT candidate. Usage is tallied across ALL projects, so zero means unused everywhere — already cross-project-safe, so never worry you're flagging something used in another repo.
-   - `type: "memory"` (CLAUDE.md, MEMORY.md) is always-loaded context, judged by size only — never call it "unused."
-   - `type: "command"` (slash commands): usage is NOT tracked in v1, so commands always show 0 calls. Judge them by cost only, like memory — NEVER flag a command as a CUT candidate based on its (always-zero) usage.
-   - `scope: "plugin"` skills are managed by their plugin: surface their cost but do NOT offer to disable them (the user removes the plugin instead).
-   - `persistent_tokens_est` is paid every turn; prioritise high-persistent + zero-usage items.
-   - `cost_basis: "unknown-v1"` (all MCP servers): the per-server token cost is NOT measured in v1 — say so plainly. Flag unused MCP servers by usage, and note MCP schemas can cost thousands of tokens per turn.
-   - Spot **redundancy**: items whose names/descriptions overlap (e.g. two GitHub MCP servers, where only one is ever called).
+   It prints a compact digest:
+   ```json
+   {
+     "totals": { "context_tax_est", "reclaimable_est", "unused_mcp_count", "history_horizon_days", "parse_warnings", "note" },
+     "cut":    [ { "type", "name", "scope", "tokens", "calls_all", "last_used" } ],
+     "cut_truncated": 0,
+     "review": [ { "type", "name", "tokens" } ],
+     "kept":   { "count", "tokens" }
+   }
+   ```
+
+2. **Reason over the digest:**
+   - `cut` — items the analyzer judged unused (skills/subagents with 0 calls in 30 days, and MCP servers never invoked). These are the disable candidates. For `type: "mcp"`, `tokens` is `null` — flag it as unused but say its token cost isn't measured in v1.
+   - `review` — memory files (CLAUDE.md/MEMORY.md), slash commands, and plugin-provided skills. Judge these by size only; NEVER auto-cut them.
+   - `kept` — a count + token sum of actively-used items. Summarize it; don't list them.
+   - `cut_truncated > 0` → say there are that many more low-value items beyond the top ones shown.
+   - Spot **redundancy** among the `cut`/`review` names (e.g. two GitHub MCP servers where only one is ever called).
 
 3. **Present the report:**
-   - **Hero line first:** "Your setup costs ~{context_tax_est} tokens/turn (estimated). ~{reclaimable_est} is from {N} items unused in 30 days, plus {unused_mcp_count} unused MCP servers."
-   - **Table:** Item | Type | Est. tokens | Calls (30d / all) | Last used | Verdict (✂️ CUT / ⚠️ REVIEW / ✅ KEEP) | Reason.
-   - **Redundancy notes**, if any.
-   - State the horizon: "usage is based on the last {history_horizon_days} days of transcripts." If that's small, say usage data is thin rather than over-claiming "unused."
+   - **Hero line first:** "Your setup costs ~{context_tax_est} tokens/turn (estimated). ~{reclaimable_est} is from {len(cut minus mcp)} items unused in 30 days, plus {unused_mcp_count} unused MCP servers."
+   - **Cut table:** Item | Type | Est. tokens | Last used | Why — one row per `cut` entry. This is the recommendation set.
+   - **Kept:** one line — "Keeping {kept.count} actively-used items (~{kept.tokens} tokens)."
+   - **Review:** brief mention of memory/command/plugin items by cost.
+   - State the horizon: "usage is based on the last {history_horizon_days} days of transcripts." If small, say usage data is thin rather than over-claiming "unused."
 
 4. **Offer reversible cleanup — NEVER act without explicit confirmation:**
-   - List the ✂️ CUT items and ask: "Want me to disable these? They're moved aside, not deleted — I'll print the undo for each."
+   - List the `cut` items and ask: "Want me to disable these? They're moved aside, not deleted — I'll print the undo for each."
    - On confirmation, per item: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/analyze.py" disable <type> <name>`, then show the user the `undo` command from its output.
 
 ## Rules
 
 - NEVER delete. Disabling is reversible; always surface the printed undo command.
-- NEVER recommend cutting an item used in any project, any `memory` item, any `command` item (command usage isn't tracked in v1), any `plugin`-scoped skill, or this skill itself.
+- Only `cut` items are disable candidates. NEVER offer to disable anything in `review` (memory, commands, plugin skills) or this skill itself.
 - Always label token figures as estimates; never present an estimate as measured.
 - If transcript history is thin, say usage data is limited rather than over-claiming "unused."
