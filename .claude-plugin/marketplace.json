@@ -10,7 +10,7 @@
       "name": "context-introspect",
       "source": "./",
       "description": "Audit your own Claude Code context — find which MCP servers and skills cost tokens or sit unused, and disable them reversibly.",
-      "version": "0.1.2"
+      "version": "0.2.0"
     }
   ]
 }

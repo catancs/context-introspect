@@ -28,7 +28,7 @@ Audit the user's own Claude Code config — which MCP servers, skills, subagents
    ```
 
 2. **Reason over the digest:**
-   - `cut` — items the analyzer judged unused (skills/subagents with 0 calls in 30 days, and MCP servers never invoked). These are the disable candidates. For `type: "mcp"`, `tokens` is `null` — flag it as unused but say its token cost isn't measured in v1.
+   - `cut` — items the analyzer judged unused (skills/subagents with 0 calls in 30 days, and MCP servers never invoked). These are the disable candidates. For `type: "mcp"`, `tokens` is `null` in the default audit — its real per-turn cost needs the `measure-mcp` pass (step 5); flag it as unused either way.
    - `review` — memory files (CLAUDE.md/MEMORY.md), slash commands, and plugin-provided skills/agents/commands that are unused. Judge these by size only; NEVER auto-cut them. For unused plugin items, note that removing the plugin is how to reclaim them.
    - `kept` — a count + token sum of actively-used items (including plugin skills the user actually invokes). Summarize it; don't list them.
    - `cut_truncated`/`review_truncated > 0` → say there are that many more items beyond the top ones shown.
@@ -44,6 +44,12 @@ Audit the user's own Claude Code config — which MCP servers, skills, subagents
 4. **Offer reversible cleanup — NEVER act without explicit confirmation:**
    - List the `cut` items and ask: "Want me to disable these? They're moved aside, not deleted — I'll print the undo for each."
    - On confirmation, per item: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/analyze.py" disable <type> <name>`, then show the user the `undo` command from its output.
+
+5. **Optional — measure exact MCP cost (opt-in; launches servers).** When the user wants the real per-turn cost of their MCP servers — the heaviest items, and `null` in the digest — run:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/analyze.py" measure-mcp
+   ```
+   It briefly launches each stdio server, performs the MCP handshake, counts its tool schemas, and prints `{ "measured": [ {name, tokens, tool_count} ], "skipped": [ {name, reason} ], "total_measured_tokens", "measured_count" }`. Remote (http/sse) servers can't be measured this way and appear in `skipped`. Present the measured tokens per server — this is usually what dominates the context tax.
 
 ## Rules
 

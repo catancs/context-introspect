@@ -17,7 +17,7 @@ There's already a tool, `unclog`, that does part of this. But it's a separate CL
 
 You ask Claude **"audit my context."** It runs a small analyzer and comes back with something like:
 
-> Your setup costs ~8,900 tokens/turn (estimated) before you type a word — and you actively use about a tenth of it. The rest splits three ways: unused skills and subagents you can disable on the spot (~600 tokens), plugins you'd reclaim by uninstalling, and MCP servers you've never once called (whose per-turn schema cost isn't measured yet, but is usually the single biggest win).
+> Your setup costs ~8,900 tokens/turn (estimated) before you type a word — and you actively use about a tenth of it. The rest splits three ways: unused skills and subagents you can disable on the spot (~600 tokens), plugins you'd reclaim by uninstalling, and MCP servers you've never once called (whose per-turn schema cost you can now measure exactly — and it's usually the single biggest win).
 
 Then a ranked table — what to keep, what to cut, and why — and an offer to disable the *disable-able* dead weight for you. Reversibly. (Plugin-managed items it flags but won't touch — it tells you to remove the plugin instead.)
 
@@ -27,7 +27,7 @@ A handful of design choices, each of which I'd make the other way for a human-fa
 
 **Real usage, not guesses.** It parses your actual session history (`~/.claude/projects/*/*.jsonl`) and counts how often each skill, subagent, and MCP server was *really* invoked, and when you last touched it. Usage is tallied across *all* your projects — so it never tells you to cut something you lean on in another repo.
 
-**Honest about what it can't measure.** Token figures are estimates, and they're labelled as estimates. Per-MCP-server cost isn't measured yet — so it flags unused servers by usage and *says so*, instead of inventing a number.
+**Honest about what it estimates.** Token figures for skills, agents, and commands are estimates, labelled as such. The default audit won't *guess* an MCP server's cost — it flags unused servers by usage instead. When you want the real number, `measure-mcp` briefly launches each stdio server and counts its actual tool schemas.
 
 **It can't hurt you.** "Disable" moves an item aside and prints the exact undo command. It never deletes. For a tool whose whole job is telling you what to remove, that felt non-negotiable.
 
@@ -46,10 +46,16 @@ Then just ask Claude: **"audit my context."**
 
 The analyzer is pure Python 3 standard library — nothing to `pip install`. You do need `python3` on your PATH.
 
+Want the exact per-turn cost of your MCP servers — usually the heaviest things in your context? Run the opt-in measure pass (Claude can do this for you, or run it directly). It briefly launches each stdio server, does the MCP handshake, and counts its real tool schemas:
+
+```shell
+python3 scripts/analyze.py measure-mcp
+```
+
 ## What's still WIP
 
-- **Per-MCP-server token cost.** Right now MCP servers are flagged by usage, not priced — measuring their real schema cost means launching each server and counting its tool definitions. That's the next thing I want to build; it's the number that actually hurts.
 - **Slash-command usage** isn't tracked yet, so commands are judged by cost only, never flagged unused.
+- **Pagination** — `measure-mcp` reads the first page of a server's `tools/list`; a server exposing a very large tool list may be slightly under-counted.
 
 ## Why I'm sharing it
 
