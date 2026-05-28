@@ -1,0 +1,15 @@
+{
+  "name": "catancs",
+  "owner": {
+    "name": "Catalin-Stefan Niculescu",
+    "url": "https://github.com/catancs"
+  },
+  "plugins": [
+    {
+      "name": "context-introspect",
+      "source": "./",
+      "description": "Audit your own Claude Code context — find which MCP servers and skills cost tokens or sit unused, and disable them reversibly.",
+      "version": "0.1.0"
+    }
+  ]
+}
