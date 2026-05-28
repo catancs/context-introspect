@@ -430,16 +430,22 @@ def disable_item(item_type: str, name: str, home: Path, project: Path, disabled_
         }, indent=2))
         file_path.write_text(json.dumps(data, indent=2))
         return {"ok": True, "disabled": name,
-                "undo": f"python3 analyze.py undo mcp {name}", "backup": str(backup)}
+                "undo": f"python3 {Path(__file__)} undo mcp {name}", "backup": str(backup)}
 
     src = _file_source(item_type, name, home, project)
     if not src:
+        if item_type == "skill":
+            plugin_skills = collect_plugin_skills(home)
+            if any(ps["name"] == name for ps in plugin_skills):
+                return {"ok": False, "error": f"'{name}' is a plugin-provided skill; disable it by removing its plugin, not via this tool"}
         return {"ok": False, "error": f"{item_type} '{name}' not found"}
     dest = _store(disabled_root, item_type, name)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return {"ok": False, "error": f"{item_type} '{name}' is already disabled"}
     shutil.move(str(src), str(dest))
     (dest.parent / f"{name}.origin").write_text(str(src))
-    return {"ok": True, "disabled": name, "undo": f"python3 analyze.py undo {item_type} {name}"}
+    return {"ok": True, "disabled": name, "undo": f"python3 {Path(__file__)} undo {item_type} {name}"}
 
 
 def undo_item(item_type: str, name: str, home: Path, project: Path, disabled_root: Path) -> dict:
@@ -451,6 +457,9 @@ def undo_item(item_type: str, name: str, home: Path, project: Path, disabled_roo
         location = saved.get("location", {})
         file_path = Path(location["file"]) if location.get("file") else home / ".claude.json"
         project_key = location.get("project_key")
+
+        if not file_path.exists():
+            return {"ok": False, "error": f"original config file no longer exists: {file_path}"}
 
         data = _load_json(file_path)
         if project_key is not None:

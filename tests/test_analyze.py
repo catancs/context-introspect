@@ -548,5 +548,148 @@ class TestDisableMcpProjectScoped(unittest.TestCase):
         self.assertIn("local-victim", mcp_data2["mcpServers"])
 
 
+# ---------------------------------------------------------------------------
+# Safety/UX fixes: Fix 1-4
+# ---------------------------------------------------------------------------
+
+class TestFix1UndoMcpPhantomFile(unittest.TestCase):
+    """Fix 1: undo_item MCP path must not create a phantom config file."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_undo_mcp_returns_error_when_config_file_deleted(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        home.mkdir()
+        project.mkdir()
+        cj = home / ".claude.json"
+        cj.write_text(_json.dumps({"mcpServers": {"myserver": {"command": "x"}}}))
+        disabled = home / ".claude" / "ci-disabled"
+
+        # Disable the MCP server (config file still exists at this point)
+        res = analyze.disable_item("mcp", "myserver", home, project, disabled)
+        self.assertTrue(res["ok"], res)
+
+        # Now delete the original config file to simulate a stale path
+        cj.unlink()
+        self.assertFalse(cj.exists())
+
+        # undo_item must NOT recreate the file
+        undo_res = analyze.undo_item("mcp", "myserver", home, project, disabled)
+        self.assertFalse(undo_res["ok"])
+        self.assertIn("no longer exists", undo_res["error"])
+        # The file must NOT have been recreated
+        self.assertFalse(cj.exists())
+
+
+class TestFix2DisableAlreadyDisabled(unittest.TestCase):
+    """Fix 2: disable_item must guard against an already-existing destination."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_disable_skill_returns_error_when_dest_exists(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        skill_dir = _write_skill(home, "myplugin", "a test skill")
+        disabled = home / ".claude" / "ci-disabled"
+
+        # Pre-create the disabled destination directory to simulate already-disabled state
+        dest = disabled / "skill" / "myplugin"
+        dest.mkdir(parents=True)
+
+        res = analyze.disable_item("skill", "myplugin", home, project, disabled)
+        self.assertFalse(res["ok"])
+        self.assertIn("already disabled", res["error"])
+        # Original skill must still be present (untouched)
+        self.assertTrue(skill_dir.exists())
+        self.assertTrue((skill_dir / "SKILL.md").exists())
+
+
+class TestFix3PluginSkillDisable(unittest.TestCase):
+    """Fix 3: disable_item must return a clear error for plugin-provided skills."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _write_plugin_skill(self, home, skill_name, description="desc"):
+        skill_dir = (
+            home / ".claude" / "plugins" / "somemarket" / "myplugin" / "1.0.0" / "skills" / skill_name
+        )
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\ndescription: {description}\n---\nbody\n"
+        )
+        return skill_dir
+
+    def test_disable_plugin_skill_returns_plugin_provided_error(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        home.mkdir()
+        project.mkdir()
+        self._write_plugin_skill(home, "coolskill")
+        disabled = home / ".claude" / "ci-disabled"
+
+        res = analyze.disable_item("skill", "coolskill", home, project, disabled)
+        self.assertFalse(res["ok"])
+        self.assertIn("plugin-provided", res["error"])
+
+
+class TestFix4UndoHintPath(unittest.TestCase):
+    """Fix 4: the 'undo' hint in disable_item results must reference scripts/analyze.py."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_file_based_undo_hint_contains_analyze_py(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        _write_skill(home, "myhint", "hint test")
+        disabled = home / ".claude" / "ci-disabled"
+
+        res = analyze.disable_item("skill", "myhint", home, project, disabled)
+        self.assertTrue(res["ok"], res)
+        undo_cmd = res["undo"]
+        self.assertIn("analyze.py", undo_cmd)
+        self.assertTrue(undo_cmd.endswith("undo skill myhint"))
+        # Must reference the real scripts/analyze.py (absolute path)
+        import os
+        self.assertIn("scripts" + os.sep + "analyze.py", undo_cmd)
+
+    def test_mcp_undo_hint_contains_analyze_py(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        home.mkdir()
+        project.mkdir()
+        cj = home / ".claude.json"
+        cj.write_text(_json.dumps({"mcpServers": {"hintserver": {"command": "x"}}}))
+        disabled = home / ".claude" / "ci-disabled"
+
+        res = analyze.disable_item("mcp", "hintserver", home, project, disabled)
+        self.assertTrue(res["ok"], res)
+        undo_cmd = res["undo"]
+        self.assertIn("analyze.py", undo_cmd)
+        self.assertTrue(undo_cmd.endswith("undo mcp hintserver"))
+        import os
+        self.assertIn("scripts" + os.sep + "analyze.py", undo_cmd)
+
+
 if __name__ == "__main__":
     unittest.main()
