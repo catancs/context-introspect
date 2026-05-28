@@ -71,6 +71,34 @@ def _skill_item(skill_dir: Path, scope: str) -> Item:
     }
 
 
+def collect_plugin_skills(home: Path) -> list[Item]:
+    """Return Items for plugin-provided skills under ~/.claude/plugins/."""
+    plugins_dir = home / ".claude" / "plugins"
+    if not plugins_dir.is_dir():
+        return []
+    items: list[Item] = []
+    seen_paths: set[str] = set()
+    for md in plugins_dir.rglob("SKILL.md"):
+        if md.parent.parent.name != "skills":
+            continue
+        skill_dir = md.parent
+        src = str(skill_dir)
+        if src in seen_paths:
+            continue
+        seen_paths.add(src)
+        description, body = read_frontmatter(md)
+        items.append({
+            "type": "skill",
+            "name": skill_dir.name,
+            "scope": "plugin",
+            "persistent_tokens_est": estimate_tokens(description),
+            "ondemand_tokens_est": estimate_tokens(body),
+            "cost_basis": "estimated",
+            "source_path": src,
+        })
+    return items
+
+
 def collect_skills(home: Path, project: Path) -> list[Item]:
     items: list[Item] = []
     for root, scope in ((home, "user"), (project, "project")):
@@ -308,6 +336,7 @@ def build_output(items: list[Item], earliest, now) -> dict:
 def run_audit(home: Path, project: Path, now: datetime) -> dict:
     items: list[Item] = []
     items += collect_skills(home, project)
+    items += collect_plugin_skills(home)
     items += collect_md_items(home / ".claude" / "agents", "subagent", "user")
     items += collect_md_items(project / ".claude" / "agents", "subagent", "project")
     items += collect_md_items(home / ".claude" / "commands", "command", "user")
