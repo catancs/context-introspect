@@ -927,5 +927,222 @@ class TestFileSourcePicksLarger(unittest.TestCase):
         self.assertIsNone(result)
 
 
+# ---------------------------------------------------------------------------
+# Change 1: verdict_for_item
+# ---------------------------------------------------------------------------
+
+def _merged_item(type_, name, scope, persistent, invocations_30d=0):
+    """Build a fully-merged item (as merge_usage would produce)."""
+    return {
+        "type": type_,
+        "name": name,
+        "scope": scope,
+        "persistent_tokens_est": persistent,
+        "ondemand_tokens_est": 0,
+        "cost_basis": "estimated",
+        "source_path": "/x",
+        "invocations_all": invocations_30d,
+        "invocations_30d": invocations_30d,
+        "last_used": None,
+        "projects_used": [],
+    }
+
+
+class TestVerdictForItem(unittest.TestCase):
+
+    def test_memory_always_review(self):
+        item = _merged_item("memory", "CLAUDE.md (user)", "user", 300, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "review")
+
+    def test_command_always_review(self):
+        item = _merged_item("command", "daily-cmd", "user", 60, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "review")
+
+    def test_plugin_skill_always_review(self):
+        item = _merged_item("skill", "coolskill", "plugin", 20, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "review")
+
+    def test_unused_skill_cut(self):
+        item = _merged_item("skill", "unused-skill", "user", 80, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "cut")
+
+    def test_used_skill_keep(self):
+        item = _merged_item("skill", "active-skill", "user", 80, invocations_30d=5)
+        self.assertEqual(analyze.verdict_for_item(item), "keep")
+
+    def test_unused_mcp_cut(self):
+        item = _merged_item("mcp", "ghost-server", "user", None, invocations_30d=0)
+        self.assertEqual(analyze.verdict_for_item(item), "cut")
+
+    def test_used_mcp_keep(self):
+        item = _merged_item("mcp", "active-server", "user", None, invocations_30d=3)
+        self.assertEqual(analyze.verdict_for_item(item), "keep")
+
+
+# ---------------------------------------------------------------------------
+# Change 2: build_summary
+# ---------------------------------------------------------------------------
+
+class TestBuildSummary(unittest.TestCase):
+
+    def setUp(self):
+        self.now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+
+    def _mixed_items(self):
+        """A list with: used skill, 2 unused skills, memory, unused mcp, plugin skill."""
+        items = [
+            _merged_item("skill", "active-skill", "user", 100, invocations_30d=5),
+            _merged_item("skill", "cold-skill-a", "user", 80, invocations_30d=0),
+            _merged_item("skill", "cold-skill-b", "user", 40, invocations_30d=0),
+            _merged_item("memory", "CLAUDE.md (user)", "user", 300, invocations_30d=0),
+            _merged_item("mcp", "ghost-server", "user", None, invocations_30d=0),
+            _merged_item("skill", "plugin-skill", "plugin", 20, invocations_30d=0),
+        ]
+        return items
+
+    def test_cut_contains_unused_skills_and_mcp_not_others(self):
+        items = self._mixed_items()
+        summary = analyze.build_summary(items, None, self.now)
+        cut_names = {c["name"] for c in summary["cut"]}
+        self.assertIn("cold-skill-a", cut_names)
+        self.assertIn("cold-skill-b", cut_names)
+        self.assertIn("ghost-server", cut_names)
+        # active-skill, memory, and plugin-skill must NOT be in cut
+        self.assertNotIn("active-skill", cut_names)
+        self.assertNotIn("CLAUDE.md (user)", cut_names)
+        self.assertNotIn("plugin-skill", cut_names)
+
+    def test_kept_counts_used_items(self):
+        items = self._mixed_items()
+        summary = analyze.build_summary(items, None, self.now)
+        self.assertEqual(summary["kept"]["count"], 1)   # only active-skill
+        self.assertEqual(summary["kept"]["tokens"], 100)
+
+    def test_review_contains_memory_and_plugin(self):
+        items = self._mixed_items()
+        summary = analyze.build_summary(items, None, self.now)
+        review_names = {r["name"] for r in summary["review"]}
+        self.assertIn("CLAUDE.md (user)", review_names)
+        self.assertIn("plugin-skill", review_names)
+        self.assertNotIn("active-skill", review_names)
+
+    def test_cut_sorted_by_tokens_desc(self):
+        items = self._mixed_items()
+        summary = analyze.build_summary(items, None, self.now)
+        cut = summary["cut"]
+        # cold-skill-a (80 tokens) must come before cold-skill-b (40 tokens)
+        names = [c["name"] for c in cut if c["name"] in ("cold-skill-a", "cold-skill-b")]
+        self.assertEqual(names, ["cold-skill-a", "cold-skill-b"])
+
+    def test_null_tokens_sorted_last(self):
+        """Items with None tokens sort after items with real token counts."""
+        items = self._mixed_items()
+        summary = analyze.build_summary(items, None, self.now)
+        cut = summary["cut"]
+        # ghost-server has None tokens; it must come last among cut items
+        self.assertEqual(cut[-1]["name"], "ghost-server")
+
+    def test_cut_truncation_at_40(self):
+        """When more than 40 items are cut-worthy, list is capped and cut_truncated set."""
+        items = [
+            _merged_item("skill", f"unused-{i}", "user", 10 + i, invocations_30d=0)
+            for i in range(50)
+        ]
+        summary = analyze.build_summary(items, None, self.now)
+        self.assertEqual(len(summary["cut"]), 40)
+        self.assertEqual(summary["cut_truncated"], 10)
+
+    def test_cut_truncated_zero_when_under_cap(self):
+        items = self._mixed_items()
+        summary = analyze.build_summary(items, None, self.now)
+        self.assertEqual(summary["cut_truncated"], 0)
+
+    def test_summary_has_required_keys(self):
+        items = self._mixed_items()
+        summary = analyze.build_summary(items, None, self.now)
+        for key in ("totals", "cut", "cut_truncated", "review", "kept"):
+            self.assertIn(key, summary)
+
+    def test_totals_matches_build_output(self):
+        """build_summary totals must equal the totals from build_output (before parse_warnings)."""
+        items = self._mixed_items()
+        full = analyze.build_output(items, None, self.now)
+        summary = analyze.build_summary(items, None, self.now)
+        # parse_warnings is added by run_audit/run_summary — not by build_output/build_summary
+        for k, v in full["totals"].items():
+            self.assertEqual(summary["totals"][k], v, f"totals[{k!r}] mismatch")
+
+
+# ---------------------------------------------------------------------------
+# Change 3: CLI default is compact digest; --full gives item list
+# ---------------------------------------------------------------------------
+
+class TestMainCLIOutput(unittest.TestCase):
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _make_fixture(self):
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        _write_skill(home, "unused-skill", "an unused skill with a description")
+        _write_skill(home, "active-skill", "an active skill description")
+        # Put a small transcript so active-skill has usage
+        projects = home / ".claude" / "projects"
+        _write_transcript(
+            projects,
+            "-proj",
+            [_assistant_line("2026-05-27T10:00:00Z", "Skill", {"skill": "active-skill"})],
+        )
+        return home, project
+
+    def _capture_run_summary(self, home, project):
+        """Call run_summary (which main() default uses) and return the parsed dict."""
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        return analyze.run_summary(home, project, now)
+
+    def test_default_output_has_summary_keys(self):
+        home, project = self._make_fixture()
+        summary = self._capture_run_summary(home, project)
+        for key in ("totals", "cut", "review", "kept"):
+            self.assertIn(key, summary)
+
+    def test_default_output_has_no_items_list(self):
+        """The compact digest must NOT contain a flat 'items' list."""
+        home, project = self._make_fixture()
+        summary = self._capture_run_summary(home, project)
+        self.assertNotIn("items", summary)
+
+    def test_default_output_is_compact_json(self):
+        """run_summary output must be parseable and small for a tiny fixture."""
+        home, project = self._make_fixture()
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        summary = analyze.run_summary(home, project, now)
+        serialized = _json.dumps(summary, default=str)
+        # For a fixture with just 2 skills the minified JSON must be well under 4000 chars
+        self.assertLess(len(serialized), 4000, f"Output too large: {len(serialized)} chars")
+
+    def test_full_flag_includes_items_list(self):
+        """run_audit (used by --full) must return a dict with an 'items' key."""
+        home, project = self._make_fixture()
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        full_out = analyze.run_audit(home, project, now)
+        self.assertIn("items", full_out)
+        self.assertIsInstance(full_out["items"], list)
+
+    def test_cut_verdict_correct_in_summary(self):
+        """The unused skill must appear in cut, the active one in kept."""
+        home, project = self._make_fixture()
+        summary = self._capture_run_summary(home, project)
+        cut_names = {c["name"] for c in summary["cut"]}
+        self.assertIn("unused-skill", cut_names)
+        self.assertNotIn("active-skill", cut_names)
+        self.assertEqual(summary["kept"]["count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
