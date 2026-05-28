@@ -310,7 +310,7 @@ def build_output(items: list[Item], earliest, now) -> dict:
     context_tax = sum(persistent(i) for i in items)
     reclaimable = sum(
         persistent(i) for i in items
-        if i["type"] != "memory"
+        if i["type"] not in ("memory", "command")
         and i["persistent_tokens_est"] is not None
         and i["invocations_30d"] == 0
     )
@@ -381,17 +381,41 @@ def run_audit(home: Path, project: Path, now: datetime) -> dict:
 # ---------------------------------------------------------------------------
 
 def _file_source(item_type: str, name: str, home: Path, project: Path) -> Path | None:
+    def _skill_tokens(path: Path) -> int:
+        """Return persistent_tokens_est for a skill/agent/command path."""
+        if item_type == "skill":
+            md = path / "SKILL.md"
+        else:
+            md = path  # for subagent/command the path IS the .md file
+        if not md.exists():
+            return -1
+        description, _body = read_frontmatter(md)
+        return estimate_tokens(description)
+
     if item_type == "skill":
+        candidates = []
         for root in (home, project):
             d = root / ".claude" / "skills" / name
             if d.exists():
-                return d
+                candidates.append(d)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        # Both scopes have the skill — return the one with the larger persistent_tokens_est
+        return max(candidates, key=_skill_tokens)
     elif item_type in ("subagent", "command"):
         sub = "agents" if item_type == "subagent" else "commands"
+        candidates = []
         for root in (home, project):
             f = root / ".claude" / sub / f"{name}.md"
             if f.exists():
-                return f
+                candidates.append(f)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        return max(candidates, key=_skill_tokens)
     return None
 
 

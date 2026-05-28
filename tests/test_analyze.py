@@ -833,5 +833,99 @@ class TestDedupItems(unittest.TestCase):
             td.cleanup()
 
 
+# ---------------------------------------------------------------------------
+# Fix I1: command items must NOT contribute to reclaimable_est
+# ---------------------------------------------------------------------------
+
+class TestCommandNotReclaimable(unittest.TestCase):
+    """Fix I1: type=='command' items with invocations_30d==0 must be excluded
+    from reclaimable_est because their usage is not tracked via keys_for_tool."""
+
+    def test_command_not_counted_in_reclaimable(self):
+        """A command with persistent_tokens > 0 and zero 30d usage must NOT
+        add to reclaimable_est; only the genuinely-unused skill should."""
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        items = [
+            _item("skill", "unused-skill", 80),   # unused skill — IS reclaimable
+            _item("command", "daily-cmd", 60),    # command — NOT reclaimable
+        ]
+        analyze.merge_usage(items, {})  # both get invocations_30d == 0
+        out = analyze.build_output(items, None, now)
+        # reclaimable must equal only the unused skill's tokens, not the command's
+        self.assertEqual(out["totals"]["reclaimable_est"], 80)
+
+    def test_used_skill_not_reclaimable(self):
+        """Sanity: a used skill with invocations_30d > 0 is not reclaimable."""
+        now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+        items = [_item("skill", "active-skill", 100)]
+        usage = {
+            ("skill", "active-skill"): {
+                "all": 3, "30d": 3,
+                "last": now, "projects": {"-a"},
+            }
+        }
+        analyze.merge_usage(items, usage)
+        out = analyze.build_output(items, None, now)
+        self.assertEqual(out["totals"]["reclaimable_est"], 0)
+
+
+# ---------------------------------------------------------------------------
+# Fix I2: _file_source returns the copy with the larger persistent_tokens_est
+# ---------------------------------------------------------------------------
+
+class TestFileSourcePicksLarger(unittest.TestCase):
+    """Fix I2: when a skill exists in both home and project scopes,
+    _file_source must return the copy with the larger persistent_tokens_est
+    so that disable targets the same copy _dedup_items kept."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_returns_project_when_project_larger(self):
+        """project copy has a longer description -> larger tokens -> must be returned."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        # home skill: short description (fewer tokens)
+        _write_skill(home, "dup", "short", body="")
+        # project skill: long description (more tokens)
+        _write_skill(project, "dup", "a much longer description that yields more tokens than the home copy", body="")
+        result = analyze._file_source("skill", "dup", home, project)
+        expected = project / ".claude" / "skills" / "dup"
+        self.assertEqual(result, expected)
+
+    def test_returns_home_when_only_home_exists(self):
+        """Single-scope: only home copy -> returns home path."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        _write_skill(home, "solo", "only here", body="")
+        project.mkdir(parents=True, exist_ok=True)
+        result = analyze._file_source("skill", "solo", home, project)
+        expected = home / ".claude" / "skills" / "solo"
+        self.assertEqual(result, expected)
+
+    def test_returns_home_when_home_larger(self):
+        """When home description is longer, home copy is returned."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        _write_skill(home, "dup", "a very long home description with lots of detail here", body="")
+        _write_skill(project, "dup", "brief", body="")
+        result = analyze._file_source("skill", "dup", home, project)
+        expected = home / ".claude" / "skills" / "dup"
+        self.assertEqual(result, expected)
+
+    def test_returns_none_when_not_found(self):
+        """Returns None if the skill doesn't exist in either scope."""
+        home = self.tmp_path / "home"
+        project = self.tmp_path / "proj"
+        home.mkdir(parents=True, exist_ok=True)
+        project.mkdir(parents=True, exist_ok=True)
+        result = analyze._file_source("skill", "nonexistent", home, project)
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
