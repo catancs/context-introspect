@@ -1,16 +1,24 @@
 {
-  "name": "catancs",
-  "description": "Catalin's Claude Code plugins — agent-first developer tools.",
+  "name": "context-introspect",
+  "id": "context-introspect",
   "owner": {
-    "name": "Catalin-Stefan Niculescu",
-    "url": "https://github.com/catancs"
+    "name": "catancs"
+  },
+  "metadata": {
+    "description": "Claude audits its own context window, finds which MCP servers & skills tax every turn or sit unused, and disables them safely",
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "context-introspect",
       "source": "./",
-      "description": "Audit your own Claude Code context — find which MCP servers and skills cost tokens or sit unused, and disable them reversibly.",
-      "version": "0.2.0"
+      "description": "Audit your own Claude Code context, find which MCP servers and skills cost tokens or sit unused, and disable them reversibly",
+      "version": "0.2.0",
+      "author": {
+        "name": "catancs"
+      },
+      "keywords": ["context", "tokens", "mcp", "skills", "audit", "cleanup"],
+      "category": "workflow"
     }
   ]
 }
